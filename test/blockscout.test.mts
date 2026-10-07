@@ -189,12 +189,16 @@ test("a refused key or a spent budget reaches the app with a fixed text", async 
     [500, 502],
   ] as const) {
     const { fetchImpl } = explorer(status);
-    await assert.rejects(new Blockscout(KEY, { fetchImpl }).scan(ADDRESS), (error: unknown) => {
-      assert.ok(error instanceof GatewayError);
-      assert.equal(error.status, expected, String(status));
-      assert.ok(!error.message.includes(KEY));
-      return true;
-    });
+    const time = clock();
+    await assert.rejects(
+      new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep }).scan(ADDRESS),
+      (error: unknown) => {
+        assert.ok(error instanceof GatewayError);
+        assert.equal(error.status, expected, String(status));
+        assert.ok(!error.message.includes(KEY));
+        return true;
+      },
+    );
   }
 });
 
@@ -262,4 +266,30 @@ test("without a key of Blockscout, the scan route says that the relay cannot sca
   } finally {
     close();
   }
+});
+
+test("a refusal for the rate waits for the window that the explorer names and tries once more", async () => {
+  const time = clock();
+  let refusals = 1;
+  const waits: number[] = [];
+  const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+    if (refusals > 0) {
+      refusals -= 1;
+      return new Response("{}", { status: 429, headers: { "x-ratelimit-reset": "400" } });
+    }
+    return explorer().fetchImpl(url, init);
+  }) as typeof fetch;
+  const sleep = async (ms: number) => {
+    waits.push(ms);
+    time.advance(ms);
+  };
+  const scan = await new Blockscout(KEY, { fetchImpl, now: time.now, sleep }).scan(ADDRESS);
+  assert.equal(scan.transactionCount, 12);
+  assert.equal(waits[0], 400, "the wait that the header names");
+  refusals = 2;
+  await assert.rejects(new Blockscout(KEY, { fetchImpl, now: time.now, sleep }).scan(ADDRESS), (error: unknown) => {
+    assert.ok(error instanceof GatewayError);
+    assert.equal(error.status, 503);
+    return true;
+  });
 });
