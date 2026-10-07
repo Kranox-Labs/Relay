@@ -1,8 +1,11 @@
 // The HTTP interface of the relay for the app. It holds the API key of ChangeNOW, so that the key never sits in the
 // app, and it forwards only the calls of the bridge, with checked input: receive, a coin on Robinhood Chain into XMR,
-// and pay, an amount of XMR into a coin for an address on Robinhood Chain at a fixed rate. It writes no log of a request: no
-// amount, no address, and no id leaves it except toward ChangeNOW and back to the app.
+// and pay, an amount of XMR into a coin for an address on Robinhood Chain at a fixed rate. It also holds the key of
+// Blockscout for the privacy scan of an address on Robinhood Chain, so that the explorer sees the relay and not the user.
+// It writes no log of a request: no amount, no address, and no id leaves it except toward ChangeNOW or Blockscout and
+// back to the app.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { ChainScanner } from "./blockscout.mts";
 import {
   CHAIN_ASSETS,
   GatewayError,
@@ -335,7 +338,21 @@ async function ready(exchanger: Exchanger): Promise<unknown> {
   return { ok: true };
 }
 
-async function route(exchanger: Exchanger, request: IncomingMessage): Promise<[number, unknown]> {
+/** The public history of an address on Robinhood Chain, for the privacy scan of the app. */
+async function scanAddress(scanner: ChainScanner | null, url: URL): Promise<unknown> {
+  if (scanner === null) throw new GatewayError(503, "The relay cannot scan addresses yet.");
+  const address = url.searchParams.get("address") ?? "";
+  if (!EVM_ADDRESS_PATTERN.test(address)) {
+    throw new RequestError(400, "The address must be 0x and 40 hexadecimal digits.");
+  }
+  return scanner.scan(address);
+}
+
+async function route(
+  exchanger: Exchanger,
+  scanner: ChainScanner | null,
+  request: IncomingMessage,
+): Promise<[number, unknown]> {
   const url = new URL(request.url ?? "/", "http://relay");
   const method = request.method ?? "GET";
   refuseBrowsers(request);
@@ -347,6 +364,7 @@ async function route(exchanger: Exchanger, request: IncomingMessage): Promise<[n
   if (method === "GET" && url.pathname === "/v1/pay/range") return [200, await payRange(exchanger, url)];
   if (method === "GET" && url.pathname === "/v1/pay/quote") return [200, await payQuote(exchanger, url)];
   if (method === "POST" && url.pathname === "/v1/pay/swaps") return [201, await createPay(exchanger, request)];
+  if (method === "GET" && url.pathname === "/v1/scan/robinhood") return [200, await scanAddress(scanner, url)];
   const swap = SWAP_PATH.exec(url.pathname);
   if (method === "GET" && swap) return [200, await readSwap(exchanger, decodeURIComponent(swap[1]))];
   throw new RequestError(404, "The relay has no such route.");
@@ -379,9 +397,10 @@ function upstreamAnswer(error: UpstreamError): [number, string] {
   return [502, "ChangeNOW failed."];
 }
 
-export function createRelay(exchanger: Exchanger): Server {
+/** The relay of the bridge, with the scanner of addresses when the relay has a key of Blockscout. */
+export function createRelay(exchanger: Exchanger, scanner: ChainScanner | null = null): Server {
   return createServer((request, response) => {
-    route(exchanger, request).then(
+    route(exchanger, scanner, request).then(
       ([status, body]) => send(response, status, body),
       (error: unknown) => {
         if (error instanceof RequestError) {
