@@ -9,6 +9,7 @@
 // minimum is about half of the fixed one, it has no top, it gives no rate id, and below its minimum it answers 400
 // "Out of min amount" with the range.
 import { CHANGENOW_BASE_URL, MIN_AMOUNT_CACHE_MS, UPSTREAM_CALLS_PER_SECOND, UPSTREAM_TIMEOUT_MS } from "./config.mts";
+import { numberOrNull, objectOrNull, stringOrNull, type Json } from "./json.mts";
 import { CallLimiter } from "./limiter.mts";
 
 /** The coins on Robinhood Chain that the bridge takes in and pays out, with their names in the two versions of the API. */
@@ -127,8 +128,6 @@ export interface Exchanger {
   status(id: string): Promise<ExchangeStatus>;
 }
 
-type Json = Record<string, unknown>;
-
 /**
  * An answer of ChangeNOW with an error status, such as a refusal of an amount below the minimum. The message is the
  * text of ChangeNOW; the server decides how much of it reaches the app.
@@ -161,18 +160,6 @@ export class GatewayError extends Error {
     this.status = status;
     this.exchangeId = exchangeId;
   }
-}
-
-function numberOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function stringOrNull(value: unknown): string | null {
-  return typeof value === "string" && value !== "" ? value : null;
-}
-
-function objectOrNull(value: unknown): Json | null {
-  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Json) : null;
 }
 
 function requireNumber(data: Json, field: string): number {

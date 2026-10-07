@@ -6,6 +6,8 @@ export interface RelayConfig {
   host: string;
   port: number;
   changenowApiKey: string;
+  /** The key of the PRO API of Blockscout for the scan of an address, or null when the relay has none. */
+  blockscoutApiKey: string | null;
 }
 
 /** The API of ChangeNOW. v1 serves the minimum and the estimate with a standard key; v2 makes and reads exchanges. */
@@ -35,6 +37,30 @@ export const MAX_FORWARDED_MESSAGE_CHARS = 200;
  */
 export const AMOUNT_MATCH_TOLERANCE = 1e-9;
 
+/**
+ * The PRO API of Blockscout, the explorer of Robinhood Chain, which the privacy scan of an address in the app reads.
+ * CHECKED 7 Oct 2026, docs.blockscout.com/devs/pro-api-responses-and-routes: the REST API of a chain answers at
+ * https://api.blockscout.com/{chain id}/api/v2 and the API in the style of Etherscan at https://api.blockscout.com/v2/api,
+ * and the key goes in the header authorization; the explorer robinhoodchain.blockscout.com answers a script with a
+ * challenge of Cloudflare, so the relay uses this API.
+ */
+export const BLOCKSCOUT_BASE_URL = "https://api.blockscout.com";
+
+/** Robinhood Chain. CHECKED 7 Oct 2026: eth_chainId of https://rpc.mainnet.chain.robinhood.com answers 0x1237. */
+export const ROBINHOOD_CHAIN_ID = 4663;
+
+/** The free plan of the PRO API allows 5 calls a second (CHECKED 7 Oct 2026, docs.blockscout.com/devs/pro-api). */
+export const BLOCKSCOUT_CALLS_PER_SECOND = 4;
+
+/** A call waits at most this long for a free slot of the budget before the relay answers that it is busy. */
+export const BLOCKSCOUT_SLOT_WAIT_MS = 3_000;
+
+/** The relay keeps the scan of an address for this long, so that a second look spends no call. */
+export const SCAN_CACHE_MS = 10 * 60_000;
+
+/** The relay keeps at most this many scans at once, and forgets the oldest first. */
+export const SCAN_CACHE_ENTRIES = 200;
+
 const HIGHEST_PORT = 65_535;
 
 function required(name: string): string {
@@ -45,21 +71,31 @@ function required(name: string): string {
   return value;
 }
 
+/** Reads a key from the file that the variable [name] names: one line, and nothing else. */
+function readKey(name: string, service: string): string {
+  const keyFile = required(name);
+  let key: string;
+  try {
+    key = readFileSync(keyFile, "utf8").trim();
+  } catch {
+    // The message names the variable and never its value: a key pasted into the variable by mistake stays unprinted.
+    throw new Error(`The key file named by ${name} cannot be read. The variable must hold its path.`);
+  }
+  if (!key || /\s/.test(key)) {
+    throw new Error(`The key file must hold the API key of ${service} on one line, and nothing else.`);
+  }
+  return key;
+}
+
 export function loadConfig(): RelayConfig {
   const port = Number(required("RELAY_PORT"));
   if (!Number.isInteger(port) || port < 1 || port > HIGHEST_PORT) {
     throw new Error(`RELAY_PORT must be a whole number from 1 to ${HIGHEST_PORT}.`);
   }
-  const keyFile = required("CHANGENOW_API_KEY_FILE");
-  let changenowApiKey: string;
-  try {
-    changenowApiKey = readFileSync(keyFile, "utf8").trim();
-  } catch {
-    // The message names the variable and never its value: a key pasted into the variable by mistake stays unprinted.
-    throw new Error("The key file named by CHANGENOW_API_KEY_FILE cannot be read. The variable must hold its path.");
-  }
-  if (!changenowApiKey || /\s/.test(changenowApiKey)) {
-    throw new Error("The key file must hold the API key of ChangeNOW on one line, and nothing else.");
-  }
-  return { host: required("RELAY_HOST"), port, changenowApiKey };
+  const changenowApiKey = readKey("CHANGENOW_API_KEY_FILE", "ChangeNOW");
+  // The scan of an address is optional: without the variable, its route answers that the relay cannot scan yet.
+  const blockscoutApiKey = process.env.BLOCKSCOUT_API_KEY_FILE?.trim()
+    ? readKey("BLOCKSCOUT_API_KEY_FILE", "Blockscout")
+    : null;
+  return { host: required("RELAY_HOST"), port, changenowApiKey, blockscoutApiKey };
 }
