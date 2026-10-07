@@ -1,7 +1,7 @@
 // The scan of an address on Robinhood Chain: what the app gets, whatever source the relay reads, and the parts that
 // every source shares, the cache of scans and the wait for a slot of the budget of calls.
 import { GatewayError } from "./changenow.mts";
-import { SCAN_CACHE_ENTRIES, SCAN_CACHE_MS, SCAN_SLOT_WAIT_MS } from "./config.mts";
+import { SCAN_CACHE_ENTRIES, SCAN_CACHE_MS, SCAN_SLOT_WAIT_MS, SCAN_SOURCE_PAUSE_MS } from "./config.mts";
 import type { CallLimiter } from "./limiter.mts";
 
 /** One side of a transfer, with the public name of the address, if any. */
@@ -96,6 +96,40 @@ export async function takeSlot(
   while (!limiter.take()) {
     if (now() >= until) throw new GatewayError(503, "The scan is busy. Try again in a moment.");
     await sleep(pause);
+  }
+}
+
+/**
+ * Several sources of the scan in the order of preference. A source that fails with a [GatewayError], such as a spent
+ * budget, a refused key, or no answer, rests for [SCAN_SOURCE_PAUSE_MS], and the scan asks the next one. When every
+ * source fails, the last failure reaches the app.
+ */
+export class FallbackScanner implements ChainScanner {
+  readonly #sources: ChainScanner[];
+  readonly #now: () => number;
+  readonly #restingUntil = new Map<ChainScanner, number>();
+
+  constructor(sources: ChainScanner[], now: () => number = Date.now) {
+    if (sources.length === 0) throw new Error("A scanner needs at least one source.");
+    this.#sources = sources;
+    this.#now = now;
+  }
+
+  async scan(address: string): Promise<ChainScan> {
+    // A source at rest still answers when every source rests, so that a scan never fails without a call.
+    const awake = this.#sources.filter((source) => (this.#restingUntil.get(source) ?? 0) <= this.#now());
+    const order = awake.length > 0 ? awake : this.#sources;
+    let failure: GatewayError | null = null;
+    for (const source of order) {
+      try {
+        return await source.scan(address);
+      } catch (error) {
+        if (!(error instanceof GatewayError)) throw error;
+        this.#restingUntil.set(source, this.#now() + SCAN_SOURCE_PAUSE_MS);
+        failure = error;
+      }
+    }
+    throw failure ?? new GatewayError(502, "The scan failed.");
   }
 }
 

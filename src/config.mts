@@ -51,8 +51,16 @@ export const BLOCKSCOUT_BASE_URL = "https://api.blockscout.com";
 /** Robinhood Chain. CHECKED 7 Oct 2026: eth_chainId of https://rpc.mainnet.chain.robinhood.com answers 0x1237. */
 export const ROBINHOOD_CHAIN_ID = 4663;
 
-/** The free plan of the PRO API allows 5 calls a second (CHECKED 7 Oct 2026, docs.blockscout.com/devs/pro-api). */
-export const BLOCKSCOUT_CALLS_PER_SECOND = 4;
+/**
+ * The free plan of the PRO API allows 5 calls in each window of one second (CHECKED 7 Oct 2026: the headers
+ * x-ratelimit-limit 5 and x-ratelimit-reset in milliseconds) and 100,000 credits a day, of which a call of the REST
+ * API spent 20 (x-credits-remaining went from 99,700 to 99,680). A burst of the limiter and the refill of the next
+ * window stay below the limit most of the time; a refusal waits for the next window once.
+ */
+export const BLOCKSCOUT_CALLS_PER_SECOND = 3;
+
+/** A refusal for the rate waits at most this long for the next window before its one retry. */
+export const BLOCKSCOUT_RETRY_WAIT_MS = 1_500;
 
 /** A call of a scan waits at most this long for a free slot of the budget before the relay answers that it is busy. */
 export const SCAN_SLOT_WAIT_MS = 3_000;
@@ -78,6 +86,12 @@ export const METADATA_URL = "https://metadata.services.blockscout.com/api/v1/met
 
 /** The relay asks the names of at most this many addresses of one scan. */
 export const METADATA_MAX_ADDRESSES = 50;
+
+/**
+ * After a source of the scan fails, the relay skips it for this long and asks the next one, so that a spent budget of
+ * Alchemy sends the scans to Blockscout without a failed call before each of them.
+ */
+export const SCAN_SOURCE_PAUSE_MS = 10 * 60_000;
 
 /** A scan reads at most this many recent transfers in each direction. */
 export const SCAN_RECENT_TRANSFERS = 50;

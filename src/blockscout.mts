@@ -6,6 +6,7 @@
 import {
   BLOCKSCOUT_BASE_URL,
   BLOCKSCOUT_CALLS_PER_SECOND,
+  BLOCKSCOUT_RETRY_WAIT_MS,
   ROBINHOOD_CHAIN_ID,
   UPSTREAM_TIMEOUT_MS,
 } from "./config.mts";
@@ -47,6 +48,14 @@ function emptyScan(address: string): ChainScan {
 
 /** An answer of the explorer that says that it has no such address. */
 class NotFound extends Error {}
+
+/** An answer of the explorer, read before the client decides what it means. */
+interface Answer {
+  status: number;
+  ok: boolean;
+  headers: Headers;
+  text: string;
+}
 
 function count(value: unknown): number {
   const number = typeof value === "number" ? value : Number(stringOrNull(value) ?? NaN);
@@ -183,23 +192,32 @@ export class Blockscout implements ChainScanner {
         if (error instanceof NotFound) throw new GatewayError(502, "Blockscout failed.");
         throw error;
       });
-    const counters = await call(`${rest}/counters`);
-    const transactions = itemsOf(await call(`${rest}/transactions`))
+    const oldest = (action: string) =>
+      `/v2/api?chain_id=${ROBINHOOD_CHAIN_ID}&module=account&action=${action}&address=${address}&sort=asc&page=1&offset=1`;
+    // The six lists go out at once, each after its slot of the budget, because the explorer takes seconds a call.
+    const [counters, transactionPage, tokenTransferPage, tokenPage, oldestTransaction, oldestTokenTransfer] =
+      await Promise.all([
+        call(`${rest}/counters`),
+        call(`${rest}/transactions`),
+        call(`${rest}/token-transfers?type=ERC-20`),
+        call(`${rest}/tokens?type=ERC-20`),
+        call(oldest("txlist")),
+        call(oldest("tokentx")),
+      ]);
+    const transactions = itemsOf(transactionPage)
       .map(transactionOf)
       .filter((item): item is ChainTransfer => item !== null);
-    const tokenTransfers = itemsOf(await call(`${rest}/token-transfers?type=ERC-20`))
+    const tokenTransfers = itemsOf(tokenTransferPage)
       .map(tokenTransferOf)
       .filter((item): item is ChainTransfer => item !== null);
-    const holdings = itemsOf(await call(`${rest}/tokens?type=ERC-20`)).flatMap((value) => {
+    const holdings = itemsOf(tokenPage).flatMap((value) => {
       const item = objectOrNull(value);
       const token = tokenOf(item?.token);
       const amount = stringOrNull(item?.value);
       return token === null || amount === null ? [] : [{ token, value: amount }];
     });
-    const oldest = (action: string) =>
-      `/v2/api?chain_id=${ROBINHOOD_CHAIN_ID}&module=account&action=${action}&address=${address}&sort=asc&page=1&offset=1`;
-    const firstTransaction = etherscanRowOf(await call(oldest("txlist")), false);
-    const firstTokenTransfer = etherscanRowOf(await call(oldest("tokentx")), true);
+    const firstTransaction = etherscanRowOf(oldestTransaction, false);
+    const firstTokenTransfer = etherscanRowOf(oldestTokenTransfer, true);
     const labels = new Map<string, ChainParty>();
     for (const transfer of [...transactions, ...tokenTransfers]) {
       for (const party of [transfer.from, transfer.to]) {
@@ -211,8 +229,9 @@ export class Blockscout implements ChainScanner {
       address: stringOrNull(info.hash) ?? address,
       isContract: info.is_contract === true,
       balanceWei: stringOrNull(info.coin_balance) ?? "0",
-      transactionCount: count(counters.transactions_count),
-      tokenTransferCount: count(counters.token_transfers_count),
+      // The explorer fills its counters later for a new address, so a count is at least the items that it listed.
+      transactionCount: Math.max(count(counters.transactions_count), transactions.length),
+      tokenTransferCount: Math.max(count(counters.token_transfers_count), tokenTransfers.length),
       firstTransaction: named(firstTransaction, labels),
       firstTokenTransfer: named(firstTokenTransfer, labels),
       transactions,
@@ -221,7 +240,18 @@ export class Blockscout implements ChainScanner {
     };
   }
 
+  /** A call, and one more after the time that the explorer names when it refuses the first one for the rate. */
   async #call(path: string): Promise<Json> {
+    const first = await this.#once(path);
+    if (first.status !== 429) return this.#fields(first);
+    const reset = Number(first.headers.get("x-ratelimit-reset") ?? NaN);
+    const wait =
+      Number.isFinite(reset) && reset >= 0 ? Math.min(reset, BLOCKSCOUT_RETRY_WAIT_MS) : BLOCKSCOUT_RETRY_WAIT_MS;
+    await this.#sleep(wait);
+    return this.#fields(await this.#once(path));
+  }
+
+  async #once(path: string): Promise<Answer> {
     await takeSlot(this.#limiter, BLOCKSCOUT_CALLS_PER_SECOND, this.#now, this.#sleep);
     let response: Response;
     let text: string;
@@ -241,12 +271,17 @@ export class Blockscout implements ChainScanner {
     } catch {
       throw new GatewayError(502, "The answer of Blockscout could not be read.");
     }
-    if (response.status === 404) throw new NotFound();
-    if (response.status === 401 || response.status === 402 || response.status === 403) {
+    return { status: response.status, ok: response.ok, headers: response.headers, text };
+  }
+
+  /** The fields of an answer, or the failure that it stands for. */
+  #fields({ status, ok, text }: Answer): Json {
+    if (status === 404) throw new NotFound();
+    if (status === 401 || status === 402 || status === 403) {
       throw new GatewayError(502, "The relay cannot use Blockscout right now.");
     }
-    if (response.status === 429) throw new GatewayError(503, "Blockscout is busy. Try again in a minute.");
-    if (!response.ok) throw new GatewayError(502, "Blockscout failed.");
+    if (status === 429) throw new GatewayError(503, "Blockscout is busy. Try again in a minute.");
+    if (!ok) throw new GatewayError(502, "Blockscout failed.");
     let data: unknown;
     try {
       data = JSON.parse(text);
