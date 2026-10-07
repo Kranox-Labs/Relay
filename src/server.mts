@@ -5,7 +5,7 @@
 // It writes no log of a request: no amount, no address, and no id leaves it except toward ChangeNOW or Blockscout and
 // back to the app.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { ChainScanner } from "./blockscout.mts";
+import type { ChainScanner } from "./scan.mts";
 import {
   CHAIN_ASSETS,
   GatewayError,

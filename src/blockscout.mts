@@ -6,63 +6,22 @@
 import {
   BLOCKSCOUT_BASE_URL,
   BLOCKSCOUT_CALLS_PER_SECOND,
-  BLOCKSCOUT_SLOT_WAIT_MS,
   ROBINHOOD_CHAIN_ID,
-  SCAN_CACHE_ENTRIES,
-  SCAN_CACHE_MS,
   UPSTREAM_TIMEOUT_MS,
 } from "./config.mts";
 import { GatewayError } from "./changenow.mts";
 import { objectOrNull, stringOrNull, type Json } from "./json.mts";
 import { CallLimiter } from "./limiter.mts";
-
-/** One side of a transfer, with the name that the explorer gives it, if any. */
-export interface ChainParty {
-  address: string;
-  label: string | null;
-  isContract: boolean;
-}
-
-/** A coin of Robinhood Chain other than ETH, as ERC-20. */
-export interface ChainToken {
-  symbol: string;
-  address: string;
-  decimals: number;
-}
-
-/** A transfer of ETH, with [token] null, or of a token. [value] counts the smallest unit of the coin. */
-export interface ChainTransfer {
-  hash: string;
-  from: ChainParty;
-  to: ChainParty | null;
-  value: string;
-  token: ChainToken | null;
-  time: string;
-}
-
-/** A token that the address holds. */
-export interface ChainHolding {
-  token: ChainToken;
-  value: string;
-}
-
-/** What the public history of an address on Robinhood Chain shows. The lists start with the newest. */
-export interface ChainScan {
-  address: string;
-  isContract: boolean;
-  balanceWei: string;
-  transactionCount: number;
-  tokenTransferCount: number;
-  firstTransaction: ChainTransfer | null;
-  firstTokenTransfer: ChainTransfer | null;
-  transactions: ChainTransfer[];
-  tokenTransfers: ChainTransfer[];
-  holdings: ChainHolding[];
-}
-
-export interface ChainScanner {
-  scan(address: string): Promise<ChainScan>;
-}
+import {
+  ScanCache,
+  sleepFor,
+  takeSlot,
+  type ChainParty,
+  type ChainScan,
+  type ChainScanner,
+  type ChainToken,
+  type ChainTransfer,
+} from "./scan.mts";
 
 export interface BlockscoutOptions {
   fetchImpl?: typeof fetch;
@@ -189,28 +148,23 @@ export class Blockscout implements ChainScanner {
   readonly #now: () => number;
   readonly #sleep: (ms: number) => Promise<void>;
   readonly #limiter: CallLimiter;
-  readonly #cache = new Map<string, { at: number; scan: ChainScan }>();
+  readonly #cache: ScanCache;
 
-  constructor(apiKey: string, { fetchImpl = fetch, now = Date.now, sleep }: BlockscoutOptions = {}) {
+  constructor(apiKey: string, { fetchImpl = fetch, now = Date.now, sleep = sleepFor }: BlockscoutOptions = {}) {
     this.#apiKey = apiKey;
     this.#fetch = fetchImpl;
     this.#now = now;
-    this.#sleep = sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.#sleep = sleep;
     this.#limiter = new CallLimiter(BLOCKSCOUT_CALLS_PER_SECOND, now);
+    this.#cache = new ScanCache(now);
   }
 
-  /** The public history of [address]. A second scan within [SCAN_CACHE_MS] spends no call. */
+  /** The public history of [address]. A second scan within the time of the cache spends no call. */
   async scan(address: string): Promise<ChainScan> {
-    const key = address.toLowerCase();
-    const cached = this.#cache.get(key);
-    if (cached !== undefined && this.#now() - cached.at < SCAN_CACHE_MS) return cached.scan;
+    const cached = this.#cache.get(address);
+    if (cached !== null) return cached;
     const scan = await this.#read(address);
-    this.#cache.delete(key);
-    this.#cache.set(key, { at: this.#now(), scan });
-    if (this.#cache.size > SCAN_CACHE_ENTRIES) {
-      const oldest = this.#cache.keys().next().value;
-      if (oldest !== undefined) this.#cache.delete(oldest);
-    }
+    this.#cache.set(address, scan);
     return scan;
   }
 
@@ -267,18 +221,8 @@ export class Blockscout implements ChainScanner {
     };
   }
 
-  /** Waits for a slot of the budget of calls, and answers that the relay is busy when none comes in time. */
-  async #slot(): Promise<void> {
-    const until = this.#now() + BLOCKSCOUT_SLOT_WAIT_MS;
-    const pause = Math.ceil(1000 / BLOCKSCOUT_CALLS_PER_SECOND);
-    while (!this.#limiter.take()) {
-      if (this.#now() >= until) throw new GatewayError(503, "The scan is busy. Try again in a moment.");
-      await this.#sleep(pause);
-    }
-  }
-
   async #call(path: string): Promise<Json> {
-    await this.#slot();
+    await takeSlot(this.#limiter, BLOCKSCOUT_CALLS_PER_SECOND, this.#now, this.#sleep);
     let response: Response;
     let text: string;
     try {

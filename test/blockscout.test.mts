@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
-import { Blockscout, type ChainScan, type ChainScanner } from "../src/blockscout.mts";
+import { Blockscout } from "../src/blockscout.mts";
 import { GatewayError, type Exchanger } from "../src/changenow.mts";
 import { BLOCKSCOUT_CALLS_PER_SECOND, SCAN_CACHE_MS } from "../src/config.mts";
+import type { ChainScan, ChainScanner } from "../src/scan.mts";
 import { createRelay } from "../src/server.mts";
 
 const KEY = "proapi_test_key_of_the_relay";

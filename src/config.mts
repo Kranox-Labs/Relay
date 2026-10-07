@@ -8,6 +8,8 @@ export interface RelayConfig {
   changenowApiKey: string;
   /** The key of the PRO API of Blockscout for the scan of an address, or null when the relay has none. */
   blockscoutApiKey: string | null;
+  /** The key of Alchemy for the scan of an address, or null when the relay has none. The relay prefers it. */
+  alchemyApiKey: string | null;
 }
 
 /** The API of ChangeNOW. v1 serves the minimum and the estimate with a standard key; v2 makes and reads exchanges. */
@@ -52,8 +54,33 @@ export const ROBINHOOD_CHAIN_ID = 4663;
 /** The free plan of the PRO API allows 5 calls a second (CHECKED 7 Oct 2026, docs.blockscout.com/devs/pro-api). */
 export const BLOCKSCOUT_CALLS_PER_SECOND = 4;
 
-/** A call waits at most this long for a free slot of the budget before the relay answers that it is busy. */
-export const BLOCKSCOUT_SLOT_WAIT_MS = 3_000;
+/** A call of a scan waits at most this long for a free slot of the budget before the relay answers that it is busy. */
+export const SCAN_SLOT_WAIT_MS = 3_000;
+
+/**
+ * The endpoint of Alchemy for Robinhood Chain, which the relay prefers for the scan of an address. CHECKED 7 Oct 2026
+ * with the key of Kranox: eth_chainId answers 0x1237 with the key in the header authorization;
+ * alchemy_getAssetTransfers serves the categories external and erc20 on this network, oldest or newest first, with the
+ * time of each block, and refuses internal ("The 'internal' category is not supported for this network");
+ * alchemy_getTokenBalances answers.
+ */
+export const ALCHEMY_URL = "https://robinhood-mainnet.g.alchemy.com/v2";
+
+/** The relay makes at most this many calls to Alchemy in a second; a scan makes eight. */
+export const ALCHEMY_CALLS_PER_SECOND = 10;
+
+/**
+ * The metadata service of Blockscout, which gives the public names of addresses without a key. CHECKED 7 Oct 2026:
+ * /api/v1/metadata?addresses=…&chainId=… answers the tags of each address, and a tag of tagType "name" names it, such
+ * as "Binance: Hot Wallet" on Ethereum. The relay asks it for the names around a scan of Alchemy, which has none.
+ */
+export const METADATA_URL = "https://metadata.services.blockscout.com/api/v1/metadata";
+
+/** The relay asks the names of at most this many addresses of one scan. */
+export const METADATA_MAX_ADDRESSES = 50;
+
+/** A scan reads at most this many recent transfers in each direction. */
+export const SCAN_RECENT_TRANSFERS = 50;
 
 /** The relay keeps the scan of an address for this long, so that a second look spends no call. */
 export const SCAN_CACHE_MS = 10 * 60_000;
@@ -97,5 +124,6 @@ export function loadConfig(): RelayConfig {
   const blockscoutApiKey = process.env.BLOCKSCOUT_API_KEY_FILE?.trim()
     ? readKey("BLOCKSCOUT_API_KEY_FILE", "Blockscout")
     : null;
-  return { host: required("RELAY_HOST"), port, changenowApiKey, blockscoutApiKey };
+  const alchemyApiKey = process.env.ALCHEMY_API_KEY_FILE?.trim() ? readKey("ALCHEMY_API_KEY_FILE", "Alchemy") : null;
+  return { host: required("RELAY_HOST"), port, changenowApiKey, blockscoutApiKey, alchemyApiKey };
 }
