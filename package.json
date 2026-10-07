@@ -1,0 +1,29 @@
+{
+  "name": "@kranox/relay",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.15.1",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "start": "node --env-file=.env src/main.mts",
+    "build": "tsc --project tsconfig.build.json",
+    "test": "node --test \"test/**/*.test.mts\"",
+    "check": "tsc --project tsconfig.json",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.5",
+    "eslint": "^10.11.0",
+    "prettier": "^3.9.9",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.71.0"
+  },
+  "prettier": {
+    "printWidth": 120
+  }
+}
