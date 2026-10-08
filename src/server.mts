@@ -16,7 +16,23 @@ import {
   type Exchanger,
   type PayRate,
 } from "./changenow.mts";
-import { AMOUNT_MATCH_TOLERANCE, MAX_BODY_BYTES, MAX_FORWARDED_MESSAGE_CHARS } from "./config.mts";
+import {
+  AMOUNT_MATCH_TOLERANCE,
+  MAX_BODY_BYTES,
+  MAX_FORWARDED_MESSAGE_CHARS,
+  SWAP_TOKENS_REQUIRED,
+} from "./config.mts";
+import { CREATION_KEY_HEADER, CreationKeyInvalid, CreationKeyReused, type CreationKeys } from "./creations.mts";
+import { SWAP_TOKEN_HEADER, type SwapTokens } from "./tokens.mts";
+
+/** The parts of the relay: the exchanger, the scanner of addresses when the relay has a key for one, the read tokens
+ * of swaps, and the creations under the keys of the app. */
+export interface RelayParts {
+  exchanger: Exchanger;
+  scanner: ChainScanner | null;
+  tokens: SwapTokens;
+  creations: CreationKeys;
+}
 
 /** An amount as the app writes it: digits, and at most 18 decimals after a point. */
 const AMOUNT_PATTERN = /^\d{1,9}(\.\d{1,18})?$/;
@@ -166,6 +182,12 @@ function checkCreated(created: CreatedExchange, mismatch: string | null): void {
   if (mismatch !== null) throw new GatewayError(502, mismatch, created.id);
 }
 
+/** One header of the request as text, or undefined when the request has none. */
+function header(request: IncomingMessage, name: string): string | undefined {
+  const value = request.headers[name];
+  return typeof value === "string" ? value : undefined;
+}
+
 async function readBody(request: IncomingMessage): Promise<Record<string, unknown>> {
   let size = 0;
   const chunks: Buffer[] = [];
@@ -202,7 +224,7 @@ async function quote(exchanger: Exchanger, url: URL): Promise<unknown> {
   };
 }
 
-async function createSwap(exchanger: Exchanger, request: IncomingMessage): Promise<unknown> {
+async function createSwap(parts: RelayParts, request: IncomingMessage): Promise<unknown> {
   const body = await readBody(request);
   const asset = readAsset(body.asset);
   const amount = readAmount(body.amount);
@@ -216,18 +238,23 @@ async function createSwap(exchanger: Exchanger, request: IncomingMessage): Promi
     }
     refundAddress = body.refundAddress;
   }
-  const created = await exchanger.create(asset, amount, body.address, refundAddress);
-  // The app shows the deposit address as a code and the amount as "Send exactly", so the relay passes on only an
-  // exchange of the coin and the amount of the request, into the subaddress of the request.
-  checkCreated(created, receiveMismatch(created, asset, amount, body.address));
-  return {
-    id: created.id,
-    asset,
-    amount: created.fromAmount,
-    estimatedXmr: created.toAmount,
-    depositAddress: created.payinAddress,
-    payoutAddress: created.payoutAddress,
-  };
+  const address = body.address;
+  const fields = { route: "receive", asset, amount, address, refundAddress };
+  return parts.creations.run(header(request, CREATION_KEY_HEADER), fields, async () => {
+    const created = await parts.exchanger.create(asset, amount, address, refundAddress);
+    // The app shows the deposit address as a code and the amount as "Send exactly", so the relay passes on only an
+    // exchange of the coin and the amount of the request, into the subaddress of the request.
+    checkCreated(created, receiveMismatch(created, asset, amount, address));
+    return {
+      id: created.id,
+      asset,
+      amount: created.fromAmount,
+      estimatedXmr: created.toAmount,
+      depositAddress: created.payinAddress,
+      payoutAddress: created.payoutAddress,
+      readToken: parts.tokens.issue(created.id),
+    };
+  });
 }
 
 async function payRange(exchanger: Exchanger, url: URL): Promise<unknown> {
@@ -277,7 +304,7 @@ async function payQuote(exchanger: Exchanger, url: URL): Promise<unknown> {
   };
 }
 
-async function createPay(exchanger: Exchanger, request: IncomingMessage): Promise<unknown> {
+async function createPay(parts: RelayParts, request: IncomingMessage): Promise<unknown> {
   const body = await readBody(request);
   const asset = readAsset(body.asset);
   const rate = readRate(body.rate);
@@ -299,32 +326,50 @@ async function createPay(exchanger: Exchanger, request: IncomingMessage): Promis
   } else if (body.rateId !== undefined && body.rateId !== null) {
     throw new RequestError(400, "A floating rate takes no rate id.");
   }
-  const created = await exchanger.createPay(asset, rate, xmrAmount, address, body.refundAddress, rateId);
-  // The app sends XMR to the deposit address and trusts the recipient, so the relay passes on nothing else.
-  checkCreated(created, payMismatch(created, asset, rate, xmrAmount, address));
-  return {
-    id: created.id,
-    asset,
-    amount: created.toAmount,
-    xmrAmount: created.fromAmount,
-    depositAddress: created.payinAddress,
-    payoutAddress: created.payoutAddress,
-  };
+  const refundAddress = body.refundAddress;
+  const fields = { route: "pay", asset, rate, xmrAmount, address, refundAddress, rateId };
+  return parts.creations.run(header(request, CREATION_KEY_HEADER), fields, async () => {
+    const created = await parts.exchanger.createPay(asset, rate, xmrAmount, address, refundAddress, rateId);
+    // The app sends XMR to the deposit address and trusts the recipient, so the relay passes on nothing else.
+    checkCreated(created, payMismatch(created, asset, rate, xmrAmount, address));
+    return {
+      id: created.id,
+      asset,
+      amount: created.toAmount,
+      xmrAmount: created.fromAmount,
+      depositAddress: created.payinAddress,
+      payoutAddress: created.payoutAddress,
+      readToken: parts.tokens.issue(created.id),
+    };
+  });
 }
 
-async function readSwap(exchanger: Exchanger, id: string): Promise<unknown> {
+/**
+ * Lets a read of a swap pass when it carries the token of the swap, or, while the older apps run, no token at all; a
+ * token of another swap never passes.
+ */
+function checkSwapToken(parts: RelayParts, request: IncomingMessage, id: string): void {
+  const token = header(request, SWAP_TOKEN_HEADER);
+  if (token === undefined) {
+    if (SWAP_TOKENS_REQUIRED) throw new RequestError(401, "The read of a swap needs its token.");
+    return;
+  }
+  if (!parts.tokens.matches(id, token)) throw new RequestError(403, "The token does not belong to this swap.");
+}
+
+async function readSwap(parts: RelayParts, request: IncomingMessage, id: string): Promise<unknown> {
   if (!EXCHANGE_ID_PATTERN.test(id)) throw new RequestError(400, "The swap id has the wrong form.");
-  const status = await exchanger.status(id);
+  checkSwapToken(parts, request, id);
+  const status = await parts.exchanger.status(id);
   // Each step of a swap carries its own facts: the deposit hash, the coin that is expected and then sent with its
-  // hash, and, when the swap goes wrong, the refund with its amount, address, and hash. An id alone reads these, so
-  // the relay passes on only what the app shows, and no deposit or payout address.
+  // hash, and, when the swap goes wrong, the refund with its amount and hash. The relay passes on only what the app
+  // shows, and no address: the app knows its own refund address.
   return {
     status: status.status,
     expectedOut: status.expectedAmountTo,
     amountOut: status.amountTo,
     depositHash: status.payinHash,
     payoutHash: status.payoutHash,
-    refundAddress: status.refundAddress,
     refundHash: status.refundHash,
     refundAmount: status.refundAmount,
     updatedAt: status.updatedAt,
@@ -348,11 +393,8 @@ async function scanAddress(scanner: ChainScanner | null, url: URL): Promise<unkn
   return scanner.scan(address);
 }
 
-async function route(
-  exchanger: Exchanger,
-  scanner: ChainScanner | null,
-  request: IncomingMessage,
-): Promise<[number, unknown]> {
+async function route(parts: RelayParts, request: IncomingMessage): Promise<[number, unknown]> {
+  const { exchanger, scanner } = parts;
   const url = new URL(request.url ?? "/", "http://relay");
   const method = request.method ?? "GET";
   refuseBrowsers(request);
@@ -360,13 +402,13 @@ async function route(
   if (method === "GET" && url.pathname === "/health") return [200, { ok: true }];
   if (method === "GET" && url.pathname === "/ready") return [200, await ready(exchanger)];
   if (method === "GET" && url.pathname === "/v1/receive/quote") return [200, await quote(exchanger, url)];
-  if (method === "POST" && url.pathname === "/v1/receive/swaps") return [201, await createSwap(exchanger, request)];
+  if (method === "POST" && url.pathname === "/v1/receive/swaps") return [201, await createSwap(parts, request)];
   if (method === "GET" && url.pathname === "/v1/pay/range") return [200, await payRange(exchanger, url)];
   if (method === "GET" && url.pathname === "/v1/pay/quote") return [200, await payQuote(exchanger, url)];
-  if (method === "POST" && url.pathname === "/v1/pay/swaps") return [201, await createPay(exchanger, request)];
+  if (method === "POST" && url.pathname === "/v1/pay/swaps") return [201, await createPay(parts, request)];
   if (method === "GET" && url.pathname === "/v1/scan/robinhood") return [200, await scanAddress(scanner, url)];
   const swap = SWAP_PATH.exec(url.pathname);
-  if (method === "GET" && swap) return [200, await readSwap(exchanger, decodeURIComponent(swap[1]))];
+  if (method === "GET" && swap) return [200, await readSwap(parts, request, decodeURIComponent(swap[1]))];
   throw new RequestError(404, "The relay has no such route.");
 }
 
@@ -397,14 +439,18 @@ function upstreamAnswer(error: UpstreamError): [number, string] {
   return [502, "ChangeNOW failed."];
 }
 
-/** The relay of the bridge, with the scanner of addresses when the relay has a key of Blockscout. */
-export function createRelay(exchanger: Exchanger, scanner: ChainScanner | null = null): Server {
+/** The relay of the bridge. */
+export function createRelay(parts: RelayParts): Server {
   return createServer((request, response) => {
-    route(exchanger, scanner, request).then(
+    route(parts, request).then(
       ([status, body]) => send(response, status, body),
       (error: unknown) => {
         if (error instanceof RequestError) {
           send(response, error.status, { error: error.message });
+        } else if (error instanceof CreationKeyInvalid) {
+          send(response, 400, { error: error.message });
+        } else if (error instanceof CreationKeyReused) {
+          send(response, 422, { error: error.message });
         } else if (error instanceof GatewayError) {
           send(response, error.status, { error: error.message, exchangeId: error.exchangeId });
         } else if (error instanceof UpstreamError) {

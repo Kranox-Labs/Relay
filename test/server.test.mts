@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 import { UpstreamError, type ChainAsset, type Exchanger, type PayRate } from "../src/changenow.mts";
+import { CreationKeys } from "../src/creations.mts";
 import { createRelay } from "../src/server.mts";
+import { SwapTokens } from "../src/tokens.mts";
 
 // A Monero mainnet subaddress of a throwaway wallet, as in apps/wallet/test/core/address_test.dart.
 const MAINNET_SUBADDRESS =
@@ -126,7 +128,8 @@ const fake: Exchanger = {
   },
 };
 
-const relay = createRelay(fake);
+const tokens = new SwapTokens("a secret of the test");
+const relay = createRelay({ exchanger: fake, scanner: null, tokens, creations: new CreationKeys(60_000, 100) });
 let base = "";
 
 before(async () => {
@@ -182,6 +185,7 @@ test("makes a swap to a Monero mainnet address, with an optional refund address"
   assert.equal(status, 201);
   assert.equal(body.depositAddress, CHAIN_DEPOSIT);
   assert.equal(body.payoutAddress, MAINNET_SUBADDRESS);
+  assert.equal(body.readToken, tokens.issue("3a2360771439a3"));
   assert.deepEqual(calls, [["create", "eth", "0.0055", MAINNET_SUBADDRESS, REFUND_ADDRESS]]);
 });
 
@@ -268,7 +272,6 @@ test("reads the state of a swap, without its addresses", async () => {
     "depositHash",
     "expectedOut",
     "payoutHash",
-    "refundAddress",
     "refundAmount",
     "refundHash",
     "status",
@@ -361,6 +364,7 @@ test("makes a payment to an address on Robinhood Chain, with a refund to this wa
     xmrAmount: 0.1,
     depositAddress: XMR_DEPOSIT,
     payoutAddress: RECIPIENT.toLowerCase(),
+    readToken: tokens.issue("9f4e2c71b03ad1"),
   });
   assert.deepEqual(calls, [["createPay", "usdg", "fixed", "0.1", RECIPIENT, MAINNET_SUBADDRESS, RATE_ID]]);
 });
@@ -456,4 +460,57 @@ test("answers whether it can use its key", async () => {
 test("answers an unknown route with 404", async () => {
   const [status] = await json("/v1/nothing");
   assert.equal(status, 404);
+});
+
+test("reads a swap with its token, refuses the token of another swap, and lets the older apps read without one", async () => {
+  const id = "3a2360771439a3";
+  const withToken = await json(`/v1/swaps/${id}`, { headers: { "kranox-swap-token": tokens.issue(id) } });
+  assert.equal(withToken[0], 200);
+  const otherToken = await json(`/v1/swaps/${id}`, {
+    headers: { "kranox-swap-token": tokens.issue("9f4e2c71b03ad1") },
+  });
+  assert.deepEqual(otherToken, [403, { error: "The token does not belong to this swap." }]);
+  const madeUp = await json(`/v1/swaps/${id}`, { headers: { "kranox-swap-token": "not-a-token" } });
+  assert.equal(madeUp[0], 403);
+  const withoutToken = await json(`/v1/swaps/${id}`);
+  assert.equal(withoutToken[0], 200, "the apps up to 0.3.0 send no token");
+});
+
+test("makes one exchange for a key, also when the app tries again after a lost answer", async () => {
+  calls.length = 0;
+  const payment = {
+    asset: "usdg",
+    rate: "floating",
+    xmrAmount: "0.2",
+    address: RECIPIENT,
+    refundAddress: MAINNET_SUBADDRESS,
+  };
+  const keyed = (body: unknown, key: string): RequestInit => ({
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": key },
+    body: JSON.stringify(body),
+  });
+  const key = "c0ffee00c0ffee00c0ffee00c0ffee00";
+  const [first, second] = await Promise.all([
+    json("/v1/pay/swaps", keyed(payment, key)),
+    json("/v1/pay/swaps", keyed(payment, key)),
+  ]);
+  const [third] = await Promise.all([json("/v1/pay/swaps", keyed(payment, key))]);
+  assert.equal(first[0], 201);
+  assert.deepEqual(second, first);
+  assert.deepEqual(third, first);
+  assert.equal(calls.filter((call) => call[0] === "createPay").length, 1, "one exchange at ChangeNOW");
+
+  const otherBody = await json("/v1/pay/swaps", keyed({ ...payment, xmrAmount: "0.3" }, key));
+  assert.deepEqual(otherBody, [422, { error: "The idempotency key belongs to another request." }]);
+  const badKey = await json("/v1/pay/swaps", keyed(payment, "short"));
+  assert.deepEqual(badKey, [400, { error: "The idempotency key has the wrong form." }]);
+
+  // A refused creation is forgotten, so that a second try with the same key asks ChangeNOW again.
+  calls.length = 0;
+  const tooSmall = { asset: "eth", amount: "0.001", address: MAINNET_SUBADDRESS };
+  const refusedKey = "refused0refused0refused0";
+  assert.equal((await json("/v1/receive/swaps", keyed(tooSmall, refusedKey)))[0], 422);
+  assert.equal((await json("/v1/receive/swaps", keyed(tooSmall, refusedKey)))[0], 422);
+  assert.equal(calls.filter((call) => call[0] === "create").length, 2);
 });
