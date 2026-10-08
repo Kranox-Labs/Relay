@@ -6,6 +6,8 @@ import { GatewayError, type Exchanger } from "../src/changenow.mts";
 import { BLOCKSCOUT_CALLS_PER_SECOND, SCAN_CACHE_MS } from "../src/config.mts";
 import type { ChainScan, ChainScanner } from "../src/scan.mts";
 import { createRelay } from "../src/server.mts";
+import { CreationKeys } from "../src/creations.mts";
+import { SwapTokens } from "../src/tokens.mts";
 
 const KEY = "proapi_test_key_of_the_relay";
 
@@ -225,7 +227,12 @@ test("waits for its budget of calls instead of passing it", async () => {
 
 /** The relay with a scanner that answers from a list, and nothing behind its routes of the bridge. */
 async function relayWith(scanner: ChainScanner | null): Promise<{ base: string; close: () => void }> {
-  const relay = createRelay({} as Exchanger, scanner);
+  const relay = createRelay({
+    exchanger: {} as Exchanger,
+    scanner,
+    tokens: new SwapTokens("a secret of the test"),
+    creations: new CreationKeys(60_000, 10),
+  });
   await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
   return { base: `http://127.0.0.1:${(relay.address() as AddressInfo).port}`, close: () => relay.close() };
 }

@@ -10,6 +10,8 @@ export interface RelayConfig {
   blockscoutApiKey: string | null;
   /** The key of Alchemy for the scan of an address, or null when the relay has none. The relay prefers it. */
   alchemyApiKey: string | null;
+  /** The secret of the read tokens of swaps, which the server makes once and which never leaves it. */
+  swapTokenKey: string;
 }
 
 /** The API of ChangeNOW. v1 serves the minimum and the estimate with a standard key; v2 makes and reads exchanges. */
@@ -102,6 +104,20 @@ export const SCAN_CACHE_MS = 10 * 60_000;
 /** The relay keeps at most this many scans at once, and forgets the oldest first. */
 export const SCAN_CACHE_ENTRIES = 200;
 
+/**
+ * Whether a read of a swap needs its read token. The apps up to 0.3.0 send none, so a read without a token passes
+ * while they run; a token that a read carries must belong to the swap. Set it to true once a main release that sends
+ * tokens is out and the older apps are gone (K-18 of the security review of 0.2.0).
+ */
+export const SWAP_TOKENS_REQUIRED = false;
+
+/**
+ * The relay keeps the creation of an exchange under the key that the app sends with it this long, and at most this
+ * many at once, so that a second try after a lost answer gets the same exchange (K-14 of the security review of 0.2.0).
+ */
+export const CREATION_KEY_MS = 10 * 60_000;
+export const CREATION_KEY_ENTRIES = 2_000;
+
 const HIGHEST_PORT = 65_535;
 
 function required(name: string): string {
@@ -139,5 +155,6 @@ export function loadConfig(): RelayConfig {
     ? readKey("BLOCKSCOUT_API_KEY_FILE", "Blockscout")
     : null;
   const alchemyApiKey = process.env.ALCHEMY_API_KEY_FILE?.trim() ? readKey("ALCHEMY_API_KEY_FILE", "Alchemy") : null;
-  return { host: required("RELAY_HOST"), port, changenowApiKey, blockscoutApiKey, alchemyApiKey };
+  const swapTokenKey = readKey("SWAP_TOKEN_KEY_FILE", "the read tokens of swaps");
+  return { host: required("RELAY_HOST"), port, changenowApiKey, blockscoutApiKey, alchemyApiKey, swapTokenKey };
 }
