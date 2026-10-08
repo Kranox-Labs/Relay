@@ -23,6 +23,7 @@ import {
   SWAP_TOKENS_REQUIRED,
 } from "./config.mts";
 import { CREATION_KEY_HEADER, CreationKeyInvalid, CreationKeyReused, type CreationKeys } from "./creations.mts";
+import { NONCE_HEADER, SIGNATURE_HEADER, readNonce, type AnswerSigner } from "./signing.mts";
 import { SWAP_TOKEN_HEADER, type SwapTokens } from "./tokens.mts";
 
 /** The parts of the relay: the exchanger, the scanner of addresses when the relay has a key for one, the read tokens
@@ -32,6 +33,7 @@ export interface RelayParts {
   scanner: ChainScanner | null;
   tokens: SwapTokens;
   creations: CreationKeys;
+  signer: AnswerSigner;
 }
 
 /** An amount as the app writes it: digits, and at most 18 decimals after a point. */
@@ -75,9 +77,14 @@ class RequestError extends Error {
   }
 }
 
-function send(response: ServerResponse, status: number, body: unknown): void {
+/** Sends [body] as JSON with the signature of its text for the request with [nonce]. */
+function send(response: ServerResponse, status: number, body: unknown, signer: AnswerSigner, nonce: string): void {
   const text = JSON.stringify(body);
-  response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+  response.writeHead(status, {
+    "content-type": "application/json",
+    "cache-control": "no-store",
+    [SIGNATURE_HEADER]: signer.sign(nonce, text),
+  });
   response.end(text);
 }
 
@@ -442,22 +449,24 @@ function upstreamAnswer(error: UpstreamError): [number, string] {
 /** The relay of the bridge. */
 export function createRelay(parts: RelayParts): Server {
   return createServer((request, response) => {
+    const nonce = readNonce(header(request, NONCE_HEADER));
+    const answer = (status: number, body: unknown) => send(response, status, body, parts.signer, nonce);
     route(parts, request).then(
-      ([status, body]) => send(response, status, body),
+      ([status, body]) => answer(status, body),
       (error: unknown) => {
         if (error instanceof RequestError) {
-          send(response, error.status, { error: error.message });
+          answer(error.status, { error: error.message });
         } else if (error instanceof CreationKeyInvalid) {
-          send(response, 400, { error: error.message });
+          answer(400, { error: error.message });
         } else if (error instanceof CreationKeyReused) {
-          send(response, 422, { error: error.message });
+          answer(422, { error: error.message });
         } else if (error instanceof GatewayError) {
-          send(response, error.status, { error: error.message, exchangeId: error.exchangeId });
+          answer(error.status, { error: error.message, exchangeId: error.exchangeId });
         } else if (error instanceof UpstreamError) {
           const [status, message] = upstreamAnswer(error);
-          send(response, status, { error: message });
+          answer(status, { error: message });
         } else {
-          send(response, 500, { error: "The relay failed." });
+          answer(500, { error: "The relay failed." });
         }
       },
     );

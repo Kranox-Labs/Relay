@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { generateKeyPairSync, verify } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 import { UpstreamError, type ChainAsset, type Exchanger, type PayRate } from "../src/changenow.mts";
 import { CreationKeys } from "../src/creations.mts";
 import { createRelay } from "../src/server.mts";
+import { AnswerSigner } from "../src/signing.mts";
 import { SwapTokens } from "../src/tokens.mts";
 
 // A Monero mainnet subaddress of a throwaway wallet, as in apps/wallet/test/core/address_test.dart.
@@ -129,7 +131,14 @@ const fake: Exchanger = {
 };
 
 const tokens = new SwapTokens("a secret of the test");
-const relay = createRelay({ exchanger: fake, scanner: null, tokens, creations: new CreationKeys(60_000, 100) });
+const signingKeys = generateKeyPairSync("ec", { namedCurve: "P-256" });
+const relay = createRelay({
+  exchanger: fake,
+  scanner: null,
+  tokens,
+  creations: new CreationKeys(60_000, 100),
+  signer: new AnswerSigner(signingKeys.privateKey.export({ type: "pkcs8", format: "pem" }).toString()),
+});
 let base = "";
 
 before(async () => {
@@ -513,4 +522,27 @@ test("makes one exchange for a key, also when the app tries again after a lost a
   assert.equal((await json("/v1/receive/swaps", keyed(tooSmall, refusedKey)))[0], 422);
   assert.equal((await json("/v1/receive/swaps", keyed(tooSmall, refusedKey)))[0], 422);
   assert.equal(calls.filter((call) => call[0] === "create").length, 2);
+});
+
+test("signs each answer, also a refusal, over the nonce of its request and its body (K-10)", async () => {
+  const nonce = "n0nce0f7hetest00";
+  const signed = (answerNonce: string, text: string, signature: string | null): boolean =>
+    signature !== null &&
+    verify(
+      "sha256",
+      Buffer.from(`${answerNonce}\n${text}`, "utf8"),
+      { key: signingKeys.publicKey, dsaEncoding: "ieee-p1363" },
+      Buffer.from(signature, "base64"),
+    );
+  for (const path of ["/health", "/v1/swaps/3a2360771439a3", "/v1/no-such-route"]) {
+    const response = await fetch(`${base}${path}`, { headers: { "kranox-nonce": nonce } });
+    const text = await response.text();
+    const signature = response.headers.get("kranox-signature");
+    assert.equal(signed(nonce, text, signature), true, path);
+    assert.equal(signed("another0nonce000", text, signature), false, `${path}: an old answer for a new request`);
+    assert.equal(signed(nonce, `${text} `, signature), false, `${path}: a changed body`);
+  }
+  // An app before 0.3.1 sends no nonce, and the relay signs with an empty one.
+  const old = await fetch(`${base}/health`);
+  assert.equal(signed("", await old.text(), old.headers.get("kranox-signature")), true);
 });
