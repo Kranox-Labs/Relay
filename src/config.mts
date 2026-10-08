@@ -12,6 +12,8 @@ export interface RelayConfig {
   alchemyApiKey: string | null;
   /** The secret of the read tokens of swaps, which the server makes once and which never leaves it. */
   swapTokenKey: string;
+  /** The private key that signs every answer, as PEM text. */
+  answerSigningKey: string;
 }
 
 /** The API of ChangeNOW. v1 serves the minimum and the estimate with a standard key; v2 makes and reads exchanges. */
@@ -144,6 +146,21 @@ function readKey(name: string, service: string): string {
   return key;
 }
 
+/** Reads a private key as PEM text from the file that the variable [name] names. */
+function readPem(name: string): string {
+  const keyFile = required(name);
+  let pem: string;
+  try {
+    pem = readFileSync(keyFile, "utf8").trim();
+  } catch {
+    throw new Error(`The key file named by ${name} cannot be read. The variable must hold its path.`);
+  }
+  if (!pem.startsWith("-----BEGIN PRIVATE KEY-----") || !pem.endsWith("-----END PRIVATE KEY-----")) {
+    throw new Error(`The key file named by ${name} must hold one private key as PEM text.`);
+  }
+  return pem;
+}
+
 export function loadConfig(): RelayConfig {
   const port = Number(required("RELAY_PORT"));
   if (!Number.isInteger(port) || port < 1 || port > HIGHEST_PORT) {
@@ -156,5 +173,14 @@ export function loadConfig(): RelayConfig {
     : null;
   const alchemyApiKey = process.env.ALCHEMY_API_KEY_FILE?.trim() ? readKey("ALCHEMY_API_KEY_FILE", "Alchemy") : null;
   const swapTokenKey = readKey("SWAP_TOKEN_KEY_FILE", "the read tokens of swaps");
-  return { host: required("RELAY_HOST"), port, changenowApiKey, blockscoutApiKey, alchemyApiKey, swapTokenKey };
+  const answerSigningKey = readPem("ANSWER_SIGNING_KEY_FILE");
+  return {
+    host: required("RELAY_HOST"),
+    port,
+    changenowApiKey,
+    blockscoutApiKey,
+    alchemyApiKey,
+    swapTokenKey,
+    answerSigningKey,
+  };
 }

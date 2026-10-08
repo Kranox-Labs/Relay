@@ -1,3 +1,4 @@
+import { generateKeyPairSync } from "node:crypto";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
@@ -7,6 +8,7 @@ import { BLOCKSCOUT_CALLS_PER_SECOND, SCAN_CACHE_MS } from "../src/config.mts";
 import type { ChainScan, ChainScanner } from "../src/scan.mts";
 import { createRelay } from "../src/server.mts";
 import { CreationKeys } from "../src/creations.mts";
+import { AnswerSigner } from "../src/signing.mts";
 import { SwapTokens } from "../src/tokens.mts";
 
 const KEY = "proapi_test_key_of_the_relay";
@@ -232,6 +234,9 @@ async function relayWith(scanner: ChainScanner | null): Promise<{ base: string; 
     scanner,
     tokens: new SwapTokens("a secret of the test"),
     creations: new CreationKeys(60_000, 10),
+    signer: new AnswerSigner(
+      generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    ),
   });
   await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
   return { base: `http://127.0.0.1:${(relay.address() as AddressInfo).port}`, close: () => relay.close() };

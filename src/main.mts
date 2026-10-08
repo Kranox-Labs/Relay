@@ -7,6 +7,7 @@ import { CREATION_KEY_ENTRIES, CREATION_KEY_MS, loadConfig } from "./config.mts"
 import { CreationKeys } from "./creations.mts";
 import { FallbackScanner } from "./scan.mts";
 import { createRelay } from "./server.mts";
+import { AnswerSigner } from "./signing.mts";
 import { SwapTokens } from "./tokens.mts";
 
 const config = loadConfig();
@@ -22,6 +23,7 @@ const relay = createRelay({
   scanner,
   tokens: new SwapTokens(config.swapTokenKey),
   creations: new CreationKeys(CREATION_KEY_MS, CREATION_KEY_ENTRIES),
+  signer: new AnswerSigner(config.answerSigningKey),
 });
 relay.listen(config.port, config.host, () => {
   // The only line that the relay writes: where it answers. It never writes a request.
