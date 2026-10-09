@@ -5,7 +5,7 @@ import { after, before, test } from "node:test";
 import { UpstreamError, type ChainAsset, type Exchanger, type PayRate } from "../src/changenow.mts";
 import { CreationKeys } from "../src/creations.mts";
 import { createRelay } from "../src/server.mts";
-import { AnswerSigner } from "../src/signing.mts";
+import { AnswerSigner, answerMessage, requestHash } from "../src/signing.mts";
 import { SwapTokens } from "../src/tokens.mts";
 
 // A Monero mainnet subaddress of a throwaway wallet, as in apps/wallet/test/core/address_test.dart.
@@ -53,14 +53,15 @@ const fake: Exchanger = {
   async create(asset: ChainAsset, amount: string, address: string, refundAddress: string | null) {
     calls.push(["create", asset, amount, address, refundAddress]);
     if (amount === "0.001") throw new UpstreamError(400, "Amount is less than minimal");
-    // Four amounts stand for faults of ChangeNOW: another payout address, a deposit address that is not on Robinhood
-    // Chain, another amount, and another pair of coins.
+    // Five amounts stand for faults of ChangeNOW: another payout address, a deposit address that is not on Robinhood
+    // Chain, another amount, another pair of coins, and another refund address.
     return {
       id: "3a2360771439a3",
       fromAmount: amount === "0.0088" ? 0.0089 : Number(amount),
       toAmount: 0.0271,
       payinAddress: amount === "0.0077" ? "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq" : CHAIN_DEPOSIT,
       payoutAddress: amount === "0.0066" ? XMR_DEPOSIT : address,
+      refundAddress: amount === "0.0044" ? RECIPIENT : refundAddress,
       ...RECEIVE_PAIR,
       fromCurrency: amount === "0.0099" ? "btc" : asset,
     };
@@ -94,14 +95,15 @@ const fake: Exchanger = {
     rateId: string | null,
   ) {
     calls.push(["createPay", asset, rate, xmrAmount, address, refundAddress, rateId]);
-    // Four amounts stand for faults of ChangeNOW: a deposit address that is not a Monero one, another recipient,
-    // another amount of XMR, and another flow.
+    // Five amounts stand for faults of ChangeNOW: a deposit address that is not a Monero one, another recipient,
+    // another amount of XMR, another flow, and another refund address.
     return {
       id: "9f4e2c71b03ad1",
       fromAmount: xmrAmount === "0.88" ? 0.89 : Number(xmrAmount),
       toAmount: 51.229932,
       payinAddress: xmrAmount === "0.66" ? "0xnotmonero" : XMR_DEPOSIT,
       payoutAddress: xmrAmount === "0.77" ? REFUND_ADDRESS : address.toLowerCase(),
+      refundAddress: xmrAmount === "0.55" ? XMR_DEPOSIT : refundAddress,
       fromCurrency: "xmr",
       fromNetwork: "xmr",
       toCurrency: asset,
@@ -157,6 +159,19 @@ function post(body: unknown): RequestInit {
   return { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
 }
 
+/** Whether [signature] signs [text] under the key of the relay of the test. */
+function signedBy(text: string, signature: string | null): boolean {
+  return (
+    signature !== null &&
+    verify(
+      "sha256",
+      Buffer.from(text, "utf8"),
+      { key: signingKeys.publicKey, dsaEncoding: "ieee-p1363" },
+      Buffer.from(signature, "base64"),
+    )
+  );
+}
+
 test("quotes an amount above the minimum with an estimate", async () => {
   const [status, body] = await json("/v1/receive/quote?asset=eth&amount=0.0055");
   assert.equal(status, 200);
@@ -194,8 +209,14 @@ test("makes a swap to a Monero mainnet address, with an optional refund address"
   assert.equal(status, 201);
   assert.equal(body.depositAddress, CHAIN_DEPOSIT);
   assert.equal(body.payoutAddress, MAINNET_SUBADDRESS);
+  assert.equal(body.refundAddress, REFUND_ADDRESS, "the app compares it with the one that it sent");
   assert.equal(body.readToken, tokens.issue("3a2360771439a3"));
   assert.deepEqual(calls, [["create", "eth", "0.0055", MAINNET_SUBADDRESS, REFUND_ADDRESS]]);
+  const [, withoutRefund] = await json(
+    "/v1/receive/swaps",
+    post({ asset: "eth", amount: "0.0055", address: MAINNET_SUBADDRESS }),
+  );
+  assert.equal(withoutRefund.refundAddress, null);
 });
 
 test("refuses a swap to an address of another network or with a bad refund address", async () => {
@@ -221,8 +242,10 @@ test("passes on no swap that ChangeNOW made other than the request, and names it
     ["0.0077", "not a Robinhood Chain address"],
     ["0.0088", "another amount"],
     ["0.0099", "another pair of coins"],
+    ["0.0044", "another refund address"],
   ]) {
-    const [status, body] = await json("/v1/receive/swaps", post({ asset: "eth", amount, address: MAINNET_SUBADDRESS }));
+    const request = { asset: "eth", amount, address: MAINNET_SUBADDRESS, refundAddress: REFUND_ADDRESS };
+    const [status, body] = await json("/v1/receive/swaps", post(request));
     assert.equal(status, 502, amount);
     assert.match(String(body.error), new RegExp(reason), amount);
     assert.equal(body.exchangeId, "3a2360771439a3", amount);
@@ -280,6 +303,7 @@ test("reads the state of a swap, without its addresses", async () => {
     "amountOut",
     "depositHash",
     "expectedOut",
+    "id",
     "payoutHash",
     "refundAmount",
     "refundHash",
@@ -287,6 +311,7 @@ test("reads the state of a swap, without its addresses", async () => {
     "updatedAt",
     "validUntil",
   ]);
+  assert.equal(body.id, "3a2360771439a3", "the app compares it with the swap that it asked for");
   assert.equal(body.status, "exchanging");
   assert.equal(body.expectedOut, 0.0271);
   assert.equal(body.amountOut, null);
@@ -373,6 +398,7 @@ test("makes a payment to an address on Robinhood Chain, with a refund to this wa
     xmrAmount: 0.1,
     depositAddress: XMR_DEPOSIT,
     payoutAddress: RECIPIENT.toLowerCase(),
+    refundAddress: MAINNET_SUBADDRESS,
     readToken: tokens.issue("9f4e2c71b03ad1"),
   });
   assert.deepEqual(calls, [["createPay", "usdg", "fixed", "0.1", RECIPIENT, MAINNET_SUBADDRESS, RATE_ID]]);
@@ -425,6 +451,7 @@ test("passes on no payment that ChangeNOW made other than the request, and names
     ["0.77", "another recipient"],
     ["0.88", "another amount of XMR"],
     ["0.99", "another pair of coins"],
+    ["0.55", "another refund address"],
   ]) {
     const [status, body] = await json("/v1/pay/swaps", post({ ...good, xmrAmount }));
     assert.equal(status, 502, xmrAmount);
@@ -526,23 +553,83 @@ test("makes one exchange for a key, also when the app tries again after a lost a
 
 test("signs each answer, also a refusal, over the nonce of its request and its body (K-10)", async () => {
   const nonce = "n0nce0f7hetest00";
-  const signed = (answerNonce: string, text: string, signature: string | null): boolean =>
-    signature !== null &&
-    verify(
-      "sha256",
-      Buffer.from(`${answerNonce}\n${text}`, "utf8"),
-      { key: signingKeys.publicKey, dsaEncoding: "ieee-p1363" },
-      Buffer.from(signature, "base64"),
-    );
   for (const path of ["/health", "/v1/swaps/3a2360771439a3", "/v1/no-such-route"]) {
     const response = await fetch(`${base}${path}`, { headers: { "kranox-nonce": nonce } });
     const text = await response.text();
     const signature = response.headers.get("kranox-signature");
-    assert.equal(signed(nonce, text, signature), true, path);
-    assert.equal(signed("another0nonce000", text, signature), false, `${path}: an old answer for a new request`);
-    assert.equal(signed(nonce, `${text} `, signature), false, `${path}: a changed body`);
+    assert.equal(signedBy(`${nonce}\n${text}`, signature), true, path);
+    assert.equal(signedBy(`another0nonce000\n${text}`, signature), false, `${path}: an old answer for a new request`);
+    assert.equal(signedBy(`${nonce}\n${text} `, signature), false, `${path}: a changed body`);
   }
-  // An app before 0.3.1 sends no nonce, and the relay signs with an empty one.
-  const old = await fetch(`${base}/health`);
-  assert.equal(signed("", await old.text(), old.headers.get("kranox-signature")), true);
+});
+
+test("signs each answer also over its request and its status (wallet O-003 and relay O-004)", async () => {
+  const nonce = "n0nce0f7hetest01";
+  const requestBody = JSON.stringify({ asset: "eth", amount: "0.0055", address: MAINNET_SUBADDRESS });
+  const exchanges: [string, RequestInit, string][] = [
+    ["/v1/swaps/3a2360771439a3", {}, ""],
+    ["/v1/receive/quote?asset=eth&amount=0.0055", {}, ""],
+    ["/v1/no-such-route", {}, ""],
+    ["/v1/receive/swaps", post(JSON.parse(requestBody)), requestBody],
+    ["/v1/receive/swaps", post({ asset: "btc" }), JSON.stringify({ asset: "btc" })],
+  ];
+  for (const [target, init, sent] of exchanges) {
+    const response = await fetch(`${base}${target}`, { ...init, headers: { ...init.headers, "kranox-nonce": nonce } });
+    const body = await response.text();
+    const signature = response.headers.get("kranox-signature-v2");
+    const answer = {
+      nonce,
+      method: init.method ?? "GET",
+      target,
+      requestHash: requestHash(Buffer.from(sent, "utf8")),
+      status: response.status,
+      body,
+    };
+    assert.equal(signedBy(answerMessage(answer), signature), true, target);
+    for (const [field, value] of [
+      ["nonce", "another0nonce000"],
+      ["method", answer.method === "GET" ? "POST" : "GET"],
+      ["target", "/v1/swaps/9f4e2c71b03ad1"],
+      ["requestHash", requestHash(Buffer.from(`${sent} `, "utf8"))],
+      ["status", answer.status + 1],
+      ["body", `${body} `],
+    ] as const) {
+      assert.equal(signedBy(answerMessage({ ...answer, [field]: value }), signature), false, `${target}: ${field}`);
+    }
+    assert.equal(signedBy(`${nonce}\n${body}`, signature), false, `${target}: not a signature of the first form`);
+  }
+});
+
+test("signs nothing for a request without a nonce, as from an app before 0.3.1 (relay O-004)", async () => {
+  const withoutNonce: Record<string, string>[] = [{}, { "kranox-nonce": "short" }];
+  for (const headers of withoutNonce) {
+    const response = await fetch(`${base}/health`, { headers });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("kranox-signature"), null);
+    assert.equal(response.headers.get("kranox-signature-v2"), null);
+  }
+});
+
+test("writes the text of a signature of the second form as the app reads it", () => {
+  // The same text is in apps/wallet/test/bridge/relay_client_test.dart; both sides must agree on it.
+  const text = answerMessage({
+    nonce: "00112233445566778899aabbccddeeff",
+    method: "POST",
+    target: "/v1/pay/swaps?x=1",
+    requestHash: requestHash(Buffer.from('{"a":1}', "utf8")),
+    status: 201,
+    body: '{"id":"9f4e2c71b03ad1"}',
+  });
+  assert.equal(
+    text,
+    [
+      "kranox/answer/2",
+      "00112233445566778899aabbccddeeff",
+      "POST",
+      "/v1/pay/swaps?x=1",
+      "015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862",
+      "201",
+      '{"id":"9f4e2c71b03ad1"}',
+    ].join("\n"),
+  );
 });

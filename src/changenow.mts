@@ -1,7 +1,9 @@
 // The calls of the relay to ChangeNOW. CHECKED 5 Oct 2026, sources the Postman collection of the API
 // (documenter.getpostman.com/view/8180765/SVfTPnM8) and the public currency list: ETH and USDG on Robinhood Chain are
-// "ethhood" and "usdghood" in v1, and "eth" and "usdg" on the network "hood" in v2. Receive asks v1 for the minimum
-// and the estimate, which take a standard key, and v2 for the exchange. Pay uses v2 only: CHECKED 6 Oct 2026, the key
+// "eth" and "usdg" on the network "hood" in v2. Every call uses v2, which takes the key in a header only: until 9 Oct
+// 2026 receive asked v1 for the minimum and the estimate, which also carried the key in the query string (relay O-005
+// of the second security review); now it asks v2 for the range and the estimate of its pair at the floating rate, as
+// pay does. NOT CHECKED against ChangeNOW for receive yet: the test of the release checks a quote. Pay: CHECKED 6 Oct 2026, the key
 // of Kranox gets the fixed-rate estimate of the coin that an amount of XMR buys ("direct"), and an amount outside the
 // range of the fixed rate answers 400 with that range in XMR. On 6 Oct 2026 the owner asked for the amount of XMR as
 // the input of pay; the first take of 5 Oct 2026 asked for the amount that the recipient gets ("reverse"). The same
@@ -12,15 +14,15 @@ import { CHANGENOW_BASE_URL, MIN_AMOUNT_CACHE_MS, UPSTREAM_CALLS_PER_SECOND, UPS
 import { numberOrNull, objectOrNull, stringOrNull, type Json } from "./json.mts";
 import { CallLimiter } from "./limiter.mts";
 
-/** The coins on Robinhood Chain that the bridge takes in and pays out, with their names in the two versions of the API. */
+/** The coins on Robinhood Chain that the bridge takes in and pays out, with their names in v2 of the API. */
 export const CHAIN_ASSETS = {
-  eth: { legacyTicker: "ethhood", currency: "eth", network: "hood" },
-  usdg: { legacyTicker: "usdghood", currency: "usdg", network: "hood" },
+  eth: { currency: "eth", network: "hood" },
+  usdg: { currency: "usdg", network: "hood" },
 } as const;
 
 export type ChainAsset = keyof typeof CHAIN_ASSETS;
 
-const XMR = { legacyTicker: "xmr", currency: "xmr", network: "xmr" } as const;
+const XMR = { currency: "xmr", network: "xmr" } as const;
 
 /** The flow with a floating rate: the amount of XMR follows the market until the deposit arrives. */
 const STANDARD_FLOW = "standard";
@@ -81,6 +83,8 @@ export interface CreatedExchange {
   toAmount: number;
   payinAddress: string;
   payoutAddress: string;
+  /** The refund address, or null when the answer of ChangeNOW leaves it out. */
+  refundAddress: string | null;
   fromCurrency: string | null;
   fromNetwork: string | null;
   toCurrency: string | null;
@@ -186,6 +190,18 @@ function outOfRange(error: UpstreamError): PayOutOfRange | null {
   };
 }
 
+/** The pair of receive in a query of v2: a coin on Robinhood Chain into XMR, at the floating rate. */
+function receivePair(asset: ChainAsset): Record<string, string> {
+  const from = CHAIN_ASSETS[asset];
+  return {
+    fromCurrency: from.currency,
+    fromNetwork: from.network,
+    toCurrency: XMR.currency,
+    toNetwork: XMR.network,
+    flow: STANDARD_FLOW,
+  };
+}
+
 /** What a ChangeNow takes besides its key. The tests pass a fake fetch and a clock of their own. */
 export interface ChangeNowOptions {
   fetchImpl?: typeof fetch;
@@ -209,18 +225,17 @@ export class ChangeNow implements Exchanger {
   async minAmount(asset: ChainAsset): Promise<number> {
     const kept = this.#minAmounts.get(asset);
     if (kept !== undefined && this.#now() - kept.at < MIN_AMOUNT_CACHE_MS) return kept.value;
-    const pair = `${CHAIN_ASSETS[asset].legacyTicker}_${XMR.legacyTicker}`;
-    const data = await this.#call(`/v1/min-amount/${pair}?api_key=${encodeURIComponent(this.#apiKey)}`);
+    const data = await this.#call(`/v2/exchange/range?${new URLSearchParams(receivePair(asset))}`);
     const value = requireNumber(data, "minAmount");
     this.#minAmounts.set(asset, { value, at: this.#now() });
     return value;
   }
 
   async estimate(asset: ChainAsset, amount: string): Promise<Estimate> {
-    const pair = `${CHAIN_ASSETS[asset].legacyTicker}_${XMR.legacyTicker}`;
-    const data = await this.#call(`/v1/exchange-amount/${amount}/${pair}?api_key=${encodeURIComponent(this.#apiKey)}`);
+    const query = new URLSearchParams({ ...receivePair(asset), fromAmount: amount, type: DIRECT_TYPE });
+    const data = await this.#call(`/v2/exchange/estimated-amount?${query}`);
     return {
-      amount: requireNumber(data, "estimatedAmount"),
+      amount: requireNumber(data, "toAmount"),
       speedMinutes: stringOrNull(data.transactionSpeedForecast),
       warning: stringOrNull(data.warningMessage),
     };
@@ -336,6 +351,7 @@ export class ChangeNow implements Exchanger {
       toAmount: requireNumber(data, "toAmount"),
       payinAddress: requireString(data, "payinAddress"),
       payoutAddress: requireString(data, "payoutAddress"),
+      refundAddress: stringOrNull(data.refundAddress),
       fromCurrency: stringOrNull(data.fromCurrency),
       fromNetwork: stringOrNull(data.fromNetwork),
       toCurrency: stringOrNull(data.toCurrency),

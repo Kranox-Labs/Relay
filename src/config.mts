@@ -116,9 +116,12 @@ export const SWAP_TOKENS_REQUIRED = false;
 /**
  * The relay keeps the creation of an exchange under the key that the app sends with it this long, and at most this
  * many at once, so that a second try after a lost answer gets the same exchange (K-14 of the security review of 0.2.0).
+ * A full store refuses new keys and keeps the live ones (relay O-008 of the second security review). The budget of
+ * ChangeNOW calls makes at most 20 a second, 12,000 in the lifetime of a key, so 20,000 entries never fill with real
+ * exchanges; a failed creation leaves at once. An entry holds a hash and the answer of a creation, under 1 KB.
  */
 export const CREATION_KEY_MS = 10 * 60_000;
-export const CREATION_KEY_ENTRIES = 2_000;
+export const CREATION_KEY_ENTRIES = 20_000;
 
 const HIGHEST_PORT = 65_535;
 

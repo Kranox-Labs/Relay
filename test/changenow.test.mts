@@ -37,6 +37,31 @@ test("follows no redirect and sends the key in a header", async () => {
   assert.equal((sent[0].init.headers as Record<string, string>)["x-changenow-api-key"], KEY);
 });
 
+test("asks v2 for the minimum and the estimate of receive, with the key never in a URL (relay O-005)", async () => {
+  const { fetchImpl, sent } = fakeFetch(() =>
+    Response.json({ minAmount: 0.0041, toAmount: 0.0271, transactionSpeedForecast: "10-60", warningMessage: null }),
+  );
+  const changenow = new ChangeNow(KEY, { fetchImpl });
+  assert.equal(await changenow.minAmount("usdg"), 0.0041);
+  assert.deepEqual(await changenow.estimate("eth", "0.0055"), { amount: 0.0271, speedMinutes: "10-60", warning: null });
+  const [range, estimate] = sent.map((call) => new URL(call.url));
+  assert.equal(range.pathname, "/v2/exchange/range");
+  assert.deepEqual(Object.fromEntries(range.searchParams), {
+    fromCurrency: "usdg",
+    fromNetwork: "hood",
+    toCurrency: "xmr",
+    toNetwork: "xmr",
+    flow: "standard",
+  });
+  assert.equal(estimate.pathname, "/v2/exchange/estimated-amount");
+  assert.equal(estimate.searchParams.get("fromAmount"), "0.0055");
+  assert.equal(estimate.searchParams.get("type"), "direct");
+  for (const call of sent) {
+    assert.ok(!call.url.includes(KEY), "the key stays out of the URL");
+    assert.equal((call.init.headers as Record<string, string>)["x-changenow-api-key"], KEY);
+  }
+});
+
 test("keeps the minimum of each asset for a while, so that a burst of quotes asks ChangeNOW once", async () => {
   const time = clock();
   const { fetchImpl, sent } = fakeFetch(minimum);
@@ -53,7 +78,7 @@ test("keeps the minimum of each asset for a while, so that a burst of quotes ask
 
 test("stops calling ChangeNOW above the budget of its key, and calls again once the budget refills", async () => {
   const time = clock();
-  const { fetchImpl, sent } = fakeFetch(() => Response.json({ estimatedAmount: 0.02 }));
+  const { fetchImpl, sent } = fakeFetch(() => Response.json({ toAmount: 0.02 }));
   const changenow = new ChangeNow(KEY, { fetchImpl, now: time.now });
   for (let call = 0; call < UPSTREAM_CALLS_PER_SECOND; call++) await changenow.estimate("eth", "0.01");
   await assert.rejects(changenow.estimate("eth", "0.01"), (error: unknown) => {
