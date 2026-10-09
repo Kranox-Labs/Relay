@@ -4,6 +4,9 @@ import { GatewayError } from "./changenow.mts";
 import { SCAN_CACHE_ENTRIES, SCAN_CACHE_MS, SCAN_SLOT_WAIT_MS, SCAN_SOURCE_PAUSE_MS } from "./config.mts";
 import type { CallLimiter } from "./limiter.mts";
 
+/** An address on Robinhood Chain, an EVM chain: 0x and 40 hex digits. */
+export const EVM_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
+
 /** One side of a transfer, with the public name of the address, if any. */
 export interface ChainParty {
   address: string;

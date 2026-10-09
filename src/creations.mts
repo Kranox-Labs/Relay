@@ -15,6 +15,9 @@ export class CreationKeyReused extends Error {}
 /** The key has the wrong form. */
 export class CreationKeyInvalid extends Error {}
 
+/** The relay holds as many live keys as it can; a new key waits until one runs out. */
+export class CreationKeysFull extends Error {}
+
 interface Creation {
   fingerprint: string;
   expiresAt: number;
@@ -36,7 +39,9 @@ export class CreationKeys {
   /**
    * Runs [create] once for [key] and [request]: a second call with the same key and the same request gets the result
    * of the first, also while the first still runs. A failed creation is forgotten, so that a second try runs again.
-   * Without a key, [create] runs each time.
+   * Without a key, [create] runs each time. When the relay holds as many live keys as it can, a new key is refused
+   * and no live key goes, so that a flood of keys never makes a second exchange for the retry of a user (relay O-008
+   * of the second security review).
    */
   async run(key: string | undefined, request: unknown, create: () => Promise<unknown>): Promise<unknown> {
     if (key === undefined) return create();
@@ -50,13 +55,11 @@ export class CreationKeys {
       }
       return known.result;
     }
+    if (this.#creations.size >= this.#capacity) {
+      throw new CreationKeysFull("The relay is busy. Try again in a moment.");
+    }
     const result = create();
     this.#creations.set(key, { fingerprint, expiresAt: this.#now() + this.#lifetimeMs, result });
-    // A map keeps the order of insertion, so the first key is the oldest.
-    if (this.#creations.size > this.#capacity) {
-      const oldest = this.#creations.keys().next();
-      if (!oldest.done) this.#creations.delete(oldest.value);
-    }
     try {
       return await result;
     } catch (error) {

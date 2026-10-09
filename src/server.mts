@@ -5,7 +5,7 @@
 // It writes no log of a request: no amount, no address, and no id leaves it except toward ChangeNOW or Blockscout and
 // back to the app.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { ChainScanner } from "./scan.mts";
+import { EVM_ADDRESS_PATTERN, type ChainScanner } from "./scan.mts";
 import {
   CHAIN_ASSETS,
   GatewayError,
@@ -22,8 +22,21 @@ import {
   MAX_FORWARDED_MESSAGE_CHARS,
   SWAP_TOKENS_REQUIRED,
 } from "./config.mts";
-import { CREATION_KEY_HEADER, CreationKeyInvalid, CreationKeyReused, type CreationKeys } from "./creations.mts";
-import { NONCE_HEADER, SIGNATURE_HEADER, readNonce, type AnswerSigner } from "./signing.mts";
+import {
+  CREATION_KEY_HEADER,
+  CreationKeyInvalid,
+  CreationKeyReused,
+  CreationKeysFull,
+  type CreationKeys,
+} from "./creations.mts";
+import {
+  NONCE_HEADER,
+  SIGNATURE_HEADER,
+  SIGNATURE_V2_HEADER,
+  readNonce,
+  requestHash,
+  type AnswerSigner,
+} from "./signing.mts";
 import { SWAP_TOKEN_HEADER, type SwapTokens } from "./tokens.mts";
 
 /** The parts of the relay: the exchanger, the scanner of addresses when the relay has a key for one, the read tokens
@@ -47,9 +60,6 @@ const MONERO_ADDRESS_PATTERN = /^[48][1-9A-HJ-NP-Za-km-z]{94}$/;
 
 /** A deposit address of ChangeNOW for XMR: a standard address or a subaddress of mainnet, or an integrated address. */
 const MONERO_DEPOSIT_PATTERN = /^(?:[48][1-9A-HJ-NP-Za-km-z]{94}|4[1-9A-HJ-NP-Za-km-z]{105})$/;
-
-/** An address on Robinhood Chain, an EVM chain: 0x and 40 hex digits. */
-const EVM_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 
 /** An id of an exchange at ChangeNOW, such as 3a2360771439a3. */
 const EXCHANGE_ID_PATTERN = /^[0-9a-zA-Z]{6,64}$/;
@@ -77,15 +87,42 @@ class RequestError extends Error {
   }
 }
 
-/** Sends [body] as JSON with the signature of its text for the request with [nonce]. */
-function send(response: ServerResponse, status: number, body: unknown, signer: AnswerSigner, nonce: string): void {
+/** The headers of the signatures of an answer with [status] and the text [body]. */
+type Signatures = (status: number, body: string) => Record<string, string>;
+
+/** Sends [body] as JSON with its [signatures]. */
+function send(response: ServerResponse, status: number, body: unknown, signatures: Signatures): void {
   const text = JSON.stringify(body);
   response.writeHead(status, {
     "content-type": "application/json",
     "cache-control": "no-store",
-    [SIGNATURE_HEADER]: signer.sign(nonce, text),
+    ...signatures(status, text),
   });
   response.end(text);
+}
+
+/**
+ * The signatures of the answers to [request] with [nonce]: the first form, and the second once the relay has the
+ * hash of the body of the request. A request without a nonce, from an app before 0.3.1, which checks no signature,
+ * gets none, so that the relay signs nothing over an empty nonce (relay O-004 of the second security review).
+ */
+function signatures(
+  signer: AnswerSigner,
+  request: IncomingMessage,
+  nonce: string,
+  hash: () => string | null,
+): Signatures {
+  return (status, body) => {
+    if (nonce === "") return {};
+    const headers: Record<string, string> = { [SIGNATURE_HEADER]: signer.sign(nonce, body) };
+    const requestHash = hash();
+    if (requestHash !== null) {
+      const method = request.method ?? "GET";
+      const target = request.url ?? "/";
+      headers[SIGNATURE_V2_HEADER] = signer.signAnswer({ nonce, method, target, requestHash, status, body });
+    }
+    return headers;
+  };
 }
 
 function readAsset(value: unknown): ChainAsset {
@@ -150,12 +187,38 @@ function pairMatches(created: CreatedExchange, from: Side, to: Side, flow: strin
   );
 }
 
+/**
+ * A refund address that ChangeNOW left out passes, and so does any when the request named none; otherwise it must be
+ * the one of the request, compared by [same].
+ */
+function refundMatches(
+  created: CreatedExchange,
+  requested: string | null,
+  same: (a: string, b: string) => boolean,
+): boolean {
+  return created.refundAddress === null || requested === null || same(created.refundAddress, requested);
+}
+
+const sameText = (a: string, b: string): boolean => a === b;
+
+/** Two addresses on Robinhood Chain: the same in any case of their hex digits. */
+const sameEvmAddress = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+
 /** Why an exchange of receive differs from its request, or null when it matches. */
-function receiveMismatch(created: CreatedExchange, asset: ChainAsset, amount: string, address: string): string | null {
+function receiveMismatch(
+  created: CreatedExchange,
+  asset: ChainAsset,
+  amount: string,
+  address: string,
+  refundAddress: string | null,
+): string | null {
   if (!EVM_ADDRESS_PATTERN.test(created.payinAddress)) {
     return "ChangeNOW gave a deposit address that is not a Robinhood Chain address.";
   }
   if (created.payoutAddress !== address) return "ChangeNOW made the exchange for another Monero address.";
+  if (!refundMatches(created, refundAddress, sameEvmAddress)) {
+    return "ChangeNOW made the exchange with another refund address.";
+  }
   if (!amountsMatch(amount, created.fromAmount)) return "ChangeNOW made the exchange for another amount.";
   if (!pairMatches(created, CHAIN_ASSETS[asset], XMR_SIDE, PAY_RATES.floating)) {
     return "ChangeNOW made the exchange for another pair of coins.";
@@ -170,12 +233,16 @@ function payMismatch(
   rate: PayRate,
   xmrAmount: string,
   address: string,
+  refundAddress: string,
 ): string | null {
   if (!MONERO_DEPOSIT_PATTERN.test(created.payinAddress)) {
     return "ChangeNOW gave a deposit address that is not a Monero mainnet address.";
   }
-  if (created.payoutAddress.toLowerCase() !== address.toLowerCase()) {
+  if (!sameEvmAddress(created.payoutAddress, address)) {
     return "ChangeNOW made the exchange for another recipient.";
+  }
+  if (!refundMatches(created, refundAddress, sameText)) {
+    return "ChangeNOW made the exchange with another refund address.";
   }
   if (!amountsMatch(xmrAmount, created.fromAmount)) return "ChangeNOW made the exchange for another amount of XMR.";
   if (!pairMatches(created, XMR_SIDE, CHAIN_ASSETS[asset], PAY_RATES[rate])) {
@@ -195,7 +262,8 @@ function header(request: IncomingMessage, name: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-async function readBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+/** The bytes of the body of a request; a request without a body has none. */
+async function readRaw(request: IncomingMessage): Promise<Buffer> {
   let size = 0;
   const chunks: Buffer[] = [];
   for await (const chunk of request) {
@@ -203,8 +271,12 @@ async function readBody(request: IncomingMessage): Promise<Record<string, unknow
     if (size > MAX_BODY_BYTES) throw new RequestError(413, "The request is too large.");
     chunks.push(chunk as Buffer);
   }
+  return Buffer.concat(chunks);
+}
+
+function parseBody(raw: Buffer): Record<string, unknown> {
   try {
-    const data: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const data: unknown = JSON.parse(raw.toString("utf8"));
     if (typeof data === "object" && data !== null && !Array.isArray(data)) return data as Record<string, unknown>;
   } catch {
     // Falls through to the error below.
@@ -231,8 +303,8 @@ async function quote(exchanger: Exchanger, url: URL): Promise<unknown> {
   };
 }
 
-async function createSwap(parts: RelayParts, request: IncomingMessage): Promise<unknown> {
-  const body = await readBody(request);
+async function createSwap(parts: RelayParts, request: IncomingMessage, raw: Buffer): Promise<unknown> {
+  const body = parseBody(raw);
   const asset = readAsset(body.asset);
   const amount = readAmount(body.amount);
   if (typeof body.address !== "string" || !MONERO_ADDRESS_PATTERN.test(body.address)) {
@@ -251,7 +323,8 @@ async function createSwap(parts: RelayParts, request: IncomingMessage): Promise<
     const created = await parts.exchanger.create(asset, amount, address, refundAddress);
     // The app shows the deposit address as a code and the amount as "Send exactly", so the relay passes on only an
     // exchange of the coin and the amount of the request, into the subaddress of the request.
-    checkCreated(created, receiveMismatch(created, asset, amount, address));
+    checkCreated(created, receiveMismatch(created, asset, amount, address, refundAddress));
+    // The app compares the refund address with the one that it sent (wallet O-003 of the second security review).
     return {
       id: created.id,
       asset,
@@ -259,6 +332,7 @@ async function createSwap(parts: RelayParts, request: IncomingMessage): Promise<
       estimatedXmr: created.toAmount,
       depositAddress: created.payinAddress,
       payoutAddress: created.payoutAddress,
+      refundAddress,
       readToken: parts.tokens.issue(created.id),
     };
   });
@@ -311,8 +385,8 @@ async function payQuote(exchanger: Exchanger, url: URL): Promise<unknown> {
   };
 }
 
-async function createPay(parts: RelayParts, request: IncomingMessage): Promise<unknown> {
-  const body = await readBody(request);
+async function createPay(parts: RelayParts, request: IncomingMessage, raw: Buffer): Promise<unknown> {
+  const body = parseBody(raw);
   const asset = readAsset(body.asset);
   const rate = readRate(body.rate);
   const xmrAmount = readAmount(body.xmrAmount);
@@ -338,7 +412,8 @@ async function createPay(parts: RelayParts, request: IncomingMessage): Promise<u
   return parts.creations.run(header(request, CREATION_KEY_HEADER), fields, async () => {
     const created = await parts.exchanger.createPay(asset, rate, xmrAmount, address, refundAddress, rateId);
     // The app sends XMR to the deposit address and trusts the recipient, so the relay passes on nothing else.
-    checkCreated(created, payMismatch(created, asset, rate, xmrAmount, address));
+    checkCreated(created, payMismatch(created, asset, rate, xmrAmount, address, refundAddress));
+    // The app compares the refund address with the one that it sent (wallet O-003 of the second security review).
     return {
       id: created.id,
       asset,
@@ -346,6 +421,7 @@ async function createPay(parts: RelayParts, request: IncomingMessage): Promise<u
       xmrAmount: created.fromAmount,
       depositAddress: created.payinAddress,
       payoutAddress: created.payoutAddress,
+      refundAddress,
       readToken: parts.tokens.issue(created.id),
     };
   });
@@ -370,8 +446,10 @@ async function readSwap(parts: RelayParts, request: IncomingMessage, id: string)
   const status = await parts.exchanger.status(id);
   // Each step of a swap carries its own facts: the deposit hash, the coin that is expected and then sent with its
   // hash, and, when the swap goes wrong, the refund with its amount and hash. The relay passes on only what the app
-  // shows, and no address: the app knows its own refund address.
+  // shows, and no address: the app knows its own refund address. The id lets the app compare the state with the swap
+  // that it asked for.
   return {
+    id,
     status: status.status,
     expectedOut: status.expectedAmountTo,
     amountOut: status.amountTo,
@@ -400,7 +478,7 @@ async function scanAddress(scanner: ChainScanner | null, url: URL): Promise<unkn
   return scanner.scan(address);
 }
 
-async function route(parts: RelayParts, request: IncomingMessage): Promise<[number, unknown]> {
+async function route(parts: RelayParts, request: IncomingMessage, raw: Buffer): Promise<[number, unknown]> {
   const { exchanger, scanner } = parts;
   const url = new URL(request.url ?? "/", "http://relay");
   const method = request.method ?? "GET";
@@ -409,10 +487,10 @@ async function route(parts: RelayParts, request: IncomingMessage): Promise<[numb
   if (method === "GET" && url.pathname === "/health") return [200, { ok: true }];
   if (method === "GET" && url.pathname === "/ready") return [200, await ready(exchanger)];
   if (method === "GET" && url.pathname === "/v1/receive/quote") return [200, await quote(exchanger, url)];
-  if (method === "POST" && url.pathname === "/v1/receive/swaps") return [201, await createSwap(parts, request)];
+  if (method === "POST" && url.pathname === "/v1/receive/swaps") return [201, await createSwap(parts, request, raw)];
   if (method === "GET" && url.pathname === "/v1/pay/range") return [200, await payRange(exchanger, url)];
   if (method === "GET" && url.pathname === "/v1/pay/quote") return [200, await payQuote(exchanger, url)];
-  if (method === "POST" && url.pathname === "/v1/pay/swaps") return [201, await createPay(parts, request)];
+  if (method === "POST" && url.pathname === "/v1/pay/swaps") return [201, await createPay(parts, request, raw)];
   if (method === "GET" && url.pathname === "/v1/scan/robinhood") return [200, await scanAddress(scanner, url)];
   const swap = SWAP_PATH.exec(url.pathname);
   if (method === "GET" && swap) return [200, await readSwap(parts, request, decodeURIComponent(swap[1]))];
@@ -450,25 +528,34 @@ function upstreamAnswer(error: UpstreamError): [number, string] {
 export function createRelay(parts: RelayParts): Server {
   return createServer((request, response) => {
     const nonce = readNonce(header(request, NONCE_HEADER));
-    const answer = (status: number, body: unknown) => send(response, status, body, parts.signer, nonce);
-    route(parts, request).then(
-      ([status, body]) => answer(status, body),
-      (error: unknown) => {
-        if (error instanceof RequestError) {
-          answer(error.status, { error: error.message });
-        } else if (error instanceof CreationKeyInvalid) {
-          answer(400, { error: error.message });
-        } else if (error instanceof CreationKeyReused) {
-          answer(422, { error: error.message });
-        } else if (error instanceof GatewayError) {
-          answer(error.status, { error: error.message, exchangeId: error.exchangeId });
-        } else if (error instanceof UpstreamError) {
-          const [status, message] = upstreamAnswer(error);
-          answer(status, { error: message });
-        } else {
-          answer(500, { error: "The relay failed." });
-        }
-      },
-    );
+    let hash: string | null = null;
+    const signed = signatures(parts.signer, request, nonce, () => hash);
+    const answer = (status: number, body: unknown) => send(response, status, body, signed);
+    readRaw(request)
+      .then((raw) => {
+        hash = requestHash(raw);
+        return route(parts, request, raw);
+      })
+      .then(
+        ([status, body]) => answer(status, body),
+        (error: unknown) => {
+          if (error instanceof RequestError) {
+            answer(error.status, { error: error.message });
+          } else if (error instanceof CreationKeyInvalid) {
+            answer(400, { error: error.message });
+          } else if (error instanceof CreationKeyReused) {
+            answer(422, { error: error.message });
+          } else if (error instanceof CreationKeysFull) {
+            answer(503, { error: error.message });
+          } else if (error instanceof GatewayError) {
+            answer(error.status, { error: error.message, exchangeId: error.exchangeId });
+          } else if (error instanceof UpstreamError) {
+            const [status, message] = upstreamAnswer(error);
+            answer(status, { error: message });
+          } else {
+            answer(500, { error: "The relay failed." });
+          }
+        },
+      );
   });
 }

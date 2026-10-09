@@ -111,6 +111,8 @@ function sources(options: { status?: number; rpcError?: boolean; metadataStatus?
                 eth("0xpaid", ADDRESS.toLowerCase(), SHOP, "0x1", "2026-10-05T08:00:00.000Z"),
                 usdg("0xspent", ADDRESS.toLowerCase(), SHOP, "0x17d7840", "2026-10-06T08:00:00.000Z"),
                 { hash: "0xbroken", category: "erc20" },
+                // A hostile answer: a party that is no address, which would change the query of the metadata service.
+                eth("0xhostile", ADDRESS.toLowerCase(), `${SHOP}&chainId=1`, "0x1", "2026-10-06T09:00:00.000Z"),
               ],
             };
           }
@@ -187,9 +189,15 @@ test("names the addresses around a scan from the metadata service, and goes on w
   const plain = await new Alchemy(KEY, { fetchImpl: metadata.fetchImpl }).scan(ADDRESS);
   assert.equal(plain.firstTransaction?.from.label, null);
   assert.equal(plain.transactions.length, 2);
-  const lookup = metadata.asked.find((call) => call.url.startsWith(METADATA_URL));
-  assert.ok(lookup?.url.includes("chainId=4663"));
-  assert.ok(!lookup?.url.toLowerCase().includes(ADDRESS.toLowerCase()), "the scanned address itself is not asked");
+  const lookup = new URL(metadata.asked.find((call) => call.url.startsWith(METADATA_URL))?.url ?? "");
+  assert.deepEqual(lookup.searchParams.getAll("chainId"), ["4663"], "no party of an answer changes the query (O-006)");
+  const asked = (lookup.searchParams.get("addresses") ?? "").split(",");
+  assert.ok(
+    asked.every((address) => /^0x[0-9a-fA-F]{40}$/.test(address)),
+    asked.join(),
+  );
+  assert.ok(!asked.includes(ADDRESS.toLowerCase()), "the scanned address itself is not asked");
+  assert.ok(!plain.transactions.some((transfer) => transfer.hash === "0xhostile"));
 });
 
 test("a refused key, a spent budget, or an error of Alchemy reaches the app with a fixed text", async () => {

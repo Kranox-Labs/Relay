@@ -15,6 +15,7 @@ import { GatewayError } from "./changenow.mts";
 import { objectOrNull, stringOrNull, type Json } from "./json.mts";
 import { CallLimiter } from "./limiter.mts";
 import {
+  EVM_ADDRESS_PATTERN,
   ScanCache,
   sleepFor,
   takeSlot,
@@ -52,6 +53,9 @@ function transferOf(value: unknown): ChainTransfer | null {
   const amount = hexToDecimal(raw?.value);
   const time = stringOrNull(objectOrNull(item?.metadata)?.blockTimestamp);
   if (item === null || hash === null || from === null || amount === null || time === null) return null;
+  // The parties go on to the metadata service, so a transfer counts only with real addresses (relay O-006 of the
+  // second security review).
+  if (!EVM_ADDRESS_PATTERN.test(from) || (to !== null && !EVM_ADDRESS_PATTERN.test(to))) return null;
   let token: ChainToken | null = null;
   if (item.category === TOKENS) {
     const contract = stringOrNull(raw?.address);
@@ -211,7 +215,11 @@ export class Alchemy implements ChainScanner {
 
   /** The tag of type "name" of each of [addresses] that has one, by the lowercase address. */
   async #names(addresses: string[]): Promise<Map<string, string>> {
-    const url = `${METADATA_URL}?addresses=${addresses.join(",")}&chainId=${ROBINHOOD_CHAIN_ID}`;
+    const query = new URLSearchParams({
+      addresses: addresses.filter((address) => EVM_ADDRESS_PATTERN.test(address)).join(","),
+      chainId: String(ROBINHOOD_CHAIN_ID),
+    });
+    const url = `${METADATA_URL}?${query}`;
     const response = await this.#fetch(url, { redirect: "error", signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
     if (!response.ok) throw new Error("The metadata service failed.");
     const known = objectOrNull(objectOrNull(await response.json())?.addresses) ?? {};
