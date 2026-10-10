@@ -3,17 +3,25 @@
 // software: the shapes of /api/v2/addresses/{hash}, its counters, transactions, token transfers, and tokens, and of the
 // actions txlist and tokentx of the API in the style of Etherscan. Blockscout v12.0.0 of 6 Oct 2026 removed the
 // parameter limit of the token transfers, so the relay reads the first page of each list, which holds 50 items.
+// CHECKED 10 Oct 2026 on the PRO API for Robinhood Chain: the action txlistinternal answers the transfers that
+// contracts made, each row with transactionHash in place of hash, and with the status 2 and the message "Some internal
+// transactions within this block range have not yet been processed" for every range, old ones too; an address answers
+// the name of its verified contract in name, such as "Disperse".
 import {
   BLOCKSCOUT_BASE_URL,
   BLOCKSCOUT_CALLS_PER_SECOND,
   BLOCKSCOUT_RETRY_WAIT_MS,
   ROBINHOOD_CHAIN_ID,
+  SCAN_FUNDING_ROWS,
   UPSTREAM_TIMEOUT_MS,
 } from "./config.mts";
 import { GatewayError } from "./changenow.mts";
 import { objectOrNull, stringOrNull, type Json } from "./json.mts";
 import { CallLimiter } from "./limiter.mts";
+import { readNames } from "./names.mts";
 import {
+  bringsValue,
+  oldestOf,
   ScanCache,
   sleepFor,
   takeSlot,
@@ -22,6 +30,8 @@ import {
   type ChainScanner,
   type ChainToken,
   type ChainTransfer,
+  type Funding,
+  type FundingReader,
 } from "./scan.mts";
 
 export interface BlockscoutOptions {
@@ -43,6 +53,8 @@ function emptyScan(address: string): ChainScan {
     transactions: [],
     tokenTransfers: [],
     holdings: [],
+    firstFunding: null,
+    fundingSure: true,
   };
 }
 
@@ -113,14 +125,22 @@ function tokenTransferOf(value: unknown): ChainTransfer | null {
   return { hash, from, to, value: amount, token, time };
 }
 
-/** The first row of an answer in the style of Etherscan, of txlist or tokentx, as a transfer without names. */
-function etherscanRowOf(data: Json, withToken: boolean): ChainTransfer | null {
+/**
+ * The rows of an answer in the style of Etherscan, of txlist, txlistinternal, or tokentx, the oldest first, as
+ * transfers without names. A failed row moved nothing, so it drops out.
+ */
+function etherscanRowsOf(data: Json, withToken: boolean): ChainTransfer[] {
   const rows = Array.isArray(data.result) ? data.result : [];
-  const row = objectOrNull(rows[0]);
-  const hash = stringOrNull(row?.hash);
+  return rows.map((row) => etherscanRowOf(row, withToken)).filter((row): row is ChainTransfer => row !== null);
+}
+
+/** A row in the style of Etherscan as a transfer without names; an internal row names its transaction transactionHash. */
+function etherscanRowOf(value: unknown, withToken: boolean): ChainTransfer | null {
+  const row = objectOrNull(value);
+  const hash = stringOrNull(row?.hash) ?? stringOrNull(row?.transactionHash);
   const from = stringOrNull(row?.from);
   const seconds = Number(stringOrNull(row?.timeStamp) ?? NaN);
-  if (row === null || hash === null || from === null || !Number.isFinite(seconds)) return null;
+  if (row === null || hash === null || from === null || !Number.isFinite(seconds) || row.isError === "1") return null;
   const to = stringOrNull(row.to);
   const decimals = Number(stringOrNull(row.tokenDecimal) ?? NaN);
   const symbol = stringOrNull(row.tokenSymbol);
@@ -151,7 +171,12 @@ function named(transfer: ChainTransfer | null, labels: Map<string, ChainParty>):
   return { ...transfer, from: known(transfer.from), to: transfer.to === null ? null : known(transfer.to) };
 }
 
-export class Blockscout implements ChainScanner {
+/** The path of the oldest rows of [action] for [address], in the style of Etherscan. */
+function oldestPath(address: string, action: string): string {
+  return `/v2/api?chain_id=${ROBINHOOD_CHAIN_ID}&module=account&action=${action}&address=${address}&sort=asc&page=1&offset=${SCAN_FUNDING_ROWS}`;
+}
+
+export class Blockscout implements ChainScanner, FundingReader {
   readonly #apiKey: string;
   readonly #fetch: typeof fetch;
   readonly #now: () => number;
@@ -192,18 +217,25 @@ export class Blockscout implements ChainScanner {
         if (error instanceof NotFound) throw new GatewayError(502, "Blockscout failed.");
         throw error;
       });
-    const oldest = (action: string) =>
-      `/v2/api?chain_id=${ROBINHOOD_CHAIN_ID}&module=account&action=${action}&address=${address}&sort=asc&page=1&offset=1`;
-    // The six lists go out at once, each after its slot of the budget, because the explorer takes seconds a call.
-    const [counters, transactionPage, tokenTransferPage, tokenPage, oldestTransaction, oldestTokenTransfer] =
-      await Promise.all([
-        call(`${rest}/counters`),
-        call(`${rest}/transactions`),
-        call(`${rest}/token-transfers?type=ERC-20`),
-        call(`${rest}/tokens?type=ERC-20`),
-        call(oldest("txlist")),
-        call(oldest("tokentx")),
-      ]);
+    // The seven lists go out at once, each after its slot of the budget, because the explorer takes seconds a call. A
+    // failed list of internal transfers leaves the first funding unsure, and the rest of the scan stands.
+    const [
+      counters,
+      transactionPage,
+      tokenTransferPage,
+      tokenPage,
+      oldestTransactions,
+      oldestTokenTransfers,
+      internal,
+    ] = await Promise.all([
+      call(`${rest}/counters`),
+      call(`${rest}/transactions`),
+      call(`${rest}/token-transfers?type=ERC-20`),
+      call(`${rest}/tokens?type=ERC-20`),
+      call(oldestPath(address, "txlist")),
+      call(oldestPath(address, "tokentx")),
+      call(oldestPath(address, "txlistinternal")).catch(() => null),
+    ]);
     const transactions = itemsOf(transactionPage)
       .map(transactionOf)
       .filter((item): item is ChainTransfer => item !== null);
@@ -216,8 +248,15 @@ export class Blockscout implements ChainScanner {
       const amount = stringOrNull(item?.value);
       return token === null || amount === null ? [] : [{ token, value: amount }];
     });
-    const firstTransaction = etherscanRowOf(oldestTransaction, false);
-    const firstTokenTransfer = etherscanRowOf(oldestTokenTransfer, true);
+    const oldTransactions = etherscanRowsOf(oldestTransactions, false);
+    const oldTokenTransfers = etherscanRowsOf(oldestTokenTransfers, true);
+    const firstTransaction = oldTransactions[0] ?? null;
+    const firstTokenTransfer = oldTokenTransfers[0] ?? null;
+    const funding = await this.#fundingOf(
+      address,
+      [...oldTransactions, ...oldTokenTransfers, ...(internal === null ? [] : etherscanRowsOf(internal, false))],
+      internal !== null,
+    );
     const labels = new Map<string, ChainParty>();
     for (const transfer of [...transactions, ...tokenTransfers]) {
       for (const party of [transfer.from, transfer.to]) {
@@ -237,6 +276,58 @@ export class Blockscout implements ChainScanner {
       transactions,
       tokenTransfers,
       holdings,
+      firstFunding: funding.transfer,
+      fundingSure: funding.sure,
+    };
+  }
+
+  /**
+   * The first funding of [address] from the oldest transfers of every kind, with [known] transfers in of another
+   * source, such as Alchemy, which cannot read internal transfers. A list that fails leaves it unsure.
+   */
+  async funding(address: string, known: ChainTransfer[]): Promise<Funding> {
+    const read = (action: string, withToken: boolean) =>
+      this.#call(oldestPath(address, action)).then(
+        (data) => etherscanRowsOf(data, withToken),
+        () => null,
+      );
+    const lists = await Promise.all([read("txlist", false), read("tokentx", true), read("txlistinternal", false)]);
+    return this.#fundingOf(
+      address,
+      [...known, ...lists.flatMap((list) => list ?? [])],
+      lists.every((list) => list !== null),
+    );
+  }
+
+  /**
+   * The oldest of [transfers] that brought something of value into [address], with the public name of its sender;
+   * sure when every list was [complete] and both names answered.
+   */
+  async #fundingOf(address: string, transfers: ChainTransfer[], complete: boolean): Promise<Funding> {
+    const first = oldestOf(transfers.filter((transfer) => bringsValue(transfer, address)));
+    if (first === null) return { transfer: null, sure: complete };
+    const sender = await this.#sender(first.from);
+    return { transfer: { ...first, from: sender.party }, sure: complete && sender.sure };
+  }
+
+  /**
+   * [party] with its public name: a tag of type name of the metadata service, such as the hot wallet of an exchange, or
+   * else what the explorer names it, such as a verified contract, a domain, or a public tag; and whether it is a
+   * contract. Sure when both answered.
+   */
+  async #sender(party: ChainParty): Promise<{ party: ChainParty; sure: boolean }> {
+    const [info, names] = await Promise.all([
+      this.#call(`/${ROBINHOOD_CHAIN_ID}/api/v2/addresses/${party.address}`).then(
+        (data) => partyOf(data),
+        // An address that the explorer never saw has no name there, and that is an answer.
+        (error: unknown) => (error instanceof NotFound ? { ...party, label: null } : null),
+      ),
+      readNames(this.#fetch, [party.address]).catch(() => null),
+    ]);
+    const label = names?.get(party.address.toLowerCase()) ?? info?.label ?? null;
+    return {
+      party: { address: party.address, label, isContract: info?.isContract ?? party.isContract },
+      sure: info !== null && names !== null,
     };
   }
 

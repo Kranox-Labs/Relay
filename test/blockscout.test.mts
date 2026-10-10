@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Blockscout } from "../src/blockscout.mts";
 import { GatewayError, type Exchanger } from "../src/changenow.mts";
-import { BLOCKSCOUT_CALLS_PER_SECOND, SCAN_CACHE_MS } from "../src/config.mts";
+import { BLOCKSCOUT_CALLS_PER_SECOND, METADATA_URL, SCAN_CACHE_MS } from "../src/config.mts";
 import type { ChainScan, ChainScanner } from "../src/scan.mts";
 import { createRelay } from "../src/server.mts";
 import { CreationKeys } from "../src/creations.mts";
@@ -18,6 +18,8 @@ const ADDRESS = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
 const FUNDER = "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359";
 const SHOP = "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB";
 const USDG = "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984";
+// A contract that sends ETH to many addresses at once, which funded [ADDRESS] first through an internal transfer.
+const DISPERSE = "0x52908400098527886E0F7030069857D2E4169EE7";
 
 function party(hash: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return { hash, name: null, ens_domain_name: null, public_tags: [], is_contract: false, ...extra };
@@ -77,6 +79,46 @@ const ANSWERS: [string, unknown][] = [
     `/4663/api/v2/addresses/${ADDRESS}`,
     { hash: ADDRESS, is_contract: false, coin_balance: "4000000000000000", public_tags: [] },
   ],
+  [`/4663/api/v2/addresses/${SHOP}`, party(SHOP, { name: "Coffee Shop", is_contract: true })],
+  [
+    `/4663/api/v2/addresses/${DISPERSE}`,
+    { hash: DISPERSE, name: "Disperse", is_contract: true, public_tags: [], ens_domain_name: null },
+  ],
+  // The internal transfers before txlist, whose path starts the same way. The explorer of Robinhood Chain answers
+  // every range with the status 2 for its internal transfers that it has not yet processed.
+  [
+    "/v2/api?chain_id=4663&module=account&action=txlistinternal",
+    {
+      status: "2",
+      message: "Some internal transactions within this block range have not yet been processed",
+      result: [
+        {
+          transactionHash: "0xfailed",
+          from: SHOP.toLowerCase(),
+          to: ADDRESS.toLowerCase(),
+          value: "9000",
+          timeStamp: "1790668800",
+          isError: "1",
+        },
+        {
+          transactionHash: "0xempty",
+          from: SHOP.toLowerCase(),
+          to: ADDRESS.toLowerCase(),
+          value: "0",
+          timeStamp: "1790700000",
+          isError: "0",
+        },
+        {
+          transactionHash: "0xinternal",
+          from: DISPERSE.toLowerCase(),
+          to: ADDRESS.toLowerCase(),
+          value: "1000000000000000",
+          timeStamp: "1790755200",
+          isError: "0",
+        },
+      ],
+    },
+  ],
   [
     "/v2/api?chain_id=4663&module=account&action=txlist",
     {
@@ -117,15 +159,34 @@ interface Sent {
   init: RequestInit;
 }
 
-/** A fetch that answers as the explorer, or with [status] for every call when the test gives one. */
-function explorer(status?: number): { fetchImpl: typeof fetch; sent: Sent[] } {
+/**
+ * A fetch that answers as the explorer and its metadata service, or with [status] for every call when the test gives
+ * one. [failing] starts the paths that fail with 500, and [names] are the tags of type name of the metadata service.
+ */
+function explorer(
+  status?: number,
+  { failing = [], names = {} }: { failing?: string[]; names?: Record<string, string> } = {},
+): { fetchImpl: typeof fetch; sent: Sent[] } {
   const sent: Sent[] = [];
   const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
     const text = String(url);
     sent.push({ url: text, init: init ?? {} });
+    if (text.startsWith(METADATA_URL)) {
+      if (failing.includes(METADATA_URL)) return new Response("{}", { status: 500 });
+      return Response.json({
+        addresses: Object.fromEntries(
+          Object.entries(names).map(([address, name]) => [
+            address.toLowerCase(),
+            { tags: [{ name, tagType: "name" }] },
+          ]),
+        ),
+      });
+    }
     if (status !== undefined) return new Response("{}", { status });
-    const path = text.replace("https://api.blockscout.com", "");
-    const answer = ANSWERS.find(([start]) => path.startsWith(start));
+    // The explorer reads an address in any case of its letters.
+    const path = text.replace("https://api.blockscout.com", "").toLowerCase();
+    if (failing.some((start) => path.startsWith(start.toLowerCase()))) return new Response("{}", { status: 500 });
+    const answer = ANSWERS.find(([start]) => path.startsWith(start.toLowerCase()));
     return answer === undefined ? new Response("{}", { status: 500 }) : Response.json(answer[1]);
   }) as typeof fetch;
   return { fetchImpl, sent };
@@ -147,12 +208,19 @@ test("reads the public history of an address, with the key in a header and never
   const { fetchImpl, sent } = explorer();
   const time = clock();
   const scan = await new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep }).scan(ADDRESS);
-  assert.equal(sent.length, 7);
-  for (const call of sent) {
+  const explorerCalls = sent.filter((call) => call.url.startsWith("https://api.blockscout.com"));
+  assert.equal(explorerCalls.length, 9, "seven lists and the name of the sender of the first funding");
+  for (const call of explorerCalls) {
     assert.equal(call.init.redirect, "error");
     assert.equal((call.init.headers as Record<string, string>).authorization, `Bearer ${KEY}`);
     assert.ok(!call.url.includes(KEY), "the key stays out of every URL");
   }
+  // The metadata service is another host, which needs no key, so the key of the explorer never goes there.
+  const metadataCalls = sent.filter((call) => call.url.startsWith(METADATA_URL));
+  assert.equal(metadataCalls.length, 1);
+  assert.equal(metadataCalls[0].init.redirect, "error");
+  assert.equal(metadataCalls[0].init.headers, undefined);
+  assert.ok(!metadataCalls[0].url.includes(KEY));
   assert.equal(scan.address, ADDRESS);
   assert.equal(scan.balanceWei, "4000000000000000");
   assert.equal(scan.transactionCount, 12);
@@ -173,6 +241,65 @@ test("reads the public history of an address, with the key in a header and never
   assert.equal(scan.firstTransaction?.time, "2026-10-01T08:00:00.000Z");
   assert.equal(scan.firstTokenTransfer?.token?.symbol, "USDG");
   assert.equal(scan.firstTokenTransfer?.from.label, "Coffee Shop");
+  // The first funding: the oldest transfer of value in, here the ETH that a contract sent, named as the explorer names
+  // the contract; a failed transfer and one of nothing fund nothing.
+  assert.equal(scan.firstFunding?.hash, "0xinternal");
+  assert.deepEqual(scan.firstFunding?.from, { address: DISPERSE.toLowerCase(), label: "Disperse", isContract: true });
+  assert.equal(scan.firstFunding?.time, "2026-09-30T08:00:00.000Z");
+  assert.equal(scan.fundingSure, true);
+});
+
+test("a tag of the metadata service names the first funder before the explorer does", async () => {
+  const { fetchImpl } = explorer(undefined, { names: { [DISPERSE]: "Disperse: Airdrops" } });
+  const time = clock();
+  const scan = await new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep }).scan(ADDRESS);
+  assert.equal(scan.firstFunding?.from.label, "Disperse: Airdrops");
+  assert.equal(scan.fundingSure, true);
+});
+
+test("a failed list of internal transfers, or a failed name, leaves the first funding unsure and the scan whole", async () => {
+  for (const failing of [
+    ["/v2/api?chain_id=4663&module=account&action=txlistinternal"],
+    [`/4663/api/v2/addresses/${DISPERSE}`],
+    [METADATA_URL],
+  ]) {
+    const { fetchImpl } = explorer(undefined, { failing });
+    const time = clock();
+    const scan = await new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep }).scan(ADDRESS);
+    assert.equal(scan.fundingSure, false, failing.join());
+    assert.equal(scan.transactionCount, 12, "the rest of the scan stands");
+    assert.ok(scan.firstFunding !== null, "the oldest transfer in that the relay could read");
+  }
+  // Without the internal transfers, the oldest one in is the ETH of the exchange.
+  const { fetchImpl } = explorer(undefined, {
+    failing: ["/v2/api?chain_id=4663&module=account&action=txlistinternal"],
+  });
+  const scan = await new Blockscout(KEY, { fetchImpl }).scan(ADDRESS);
+  assert.equal(scan.firstFunding?.hash, "0xtx1");
+});
+
+test("reads the first funding for another source, with the transfers in that it already found", async () => {
+  const { fetchImpl, sent } = explorer();
+  const time = clock();
+  const blockscout = new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep });
+  const older = {
+    hash: "0xolder",
+    from: { address: SHOP, label: null, isContract: false },
+    to: { address: ADDRESS, label: null, isContract: false },
+    value: "7",
+    token: null,
+    time: "2026-08-01T08:00:00.000Z",
+  };
+  const funding = await blockscout.funding(ADDRESS, [older]);
+  assert.equal(funding.transfer?.hash, "0xolder", "a known transfer in that came earlier wins");
+  assert.equal(funding.transfer?.from.label, "Coffee Shop", "the explorer names the sender of the other source");
+  assert.equal(funding.sure, true);
+  const withoutKnown = await blockscout.funding(ADDRESS, []);
+  assert.equal(withoutKnown.transfer?.hash, "0xinternal");
+  assert.ok(
+    sent.every((call) => !call.url.includes("/counters")),
+    "the first funding reads the oldest rows and the name of the sender alone",
+  );
 });
 
 test("an address that the explorer never saw is an empty scan after one call", async () => {
@@ -211,11 +338,12 @@ test("keeps a scan for a while, so that a second look spends no call", async () 
   const time = clock();
   const blockscout = new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep });
   await blockscout.scan(ADDRESS);
+  const calls = sent.length;
   await blockscout.scan(ADDRESS.toLowerCase());
-  assert.equal(sent.length, 7);
+  assert.equal(sent.length, calls);
   time.advance(SCAN_CACHE_MS);
   await blockscout.scan(ADDRESS);
-  assert.equal(sent.length, 14);
+  assert.equal(sent.length, calls * 2);
 });
 
 test("waits for its budget of calls instead of passing it", async () => {
@@ -223,8 +351,8 @@ test("waits for its budget of calls instead of passing it", async () => {
   const time = clock();
   const start = time.now();
   await new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep }).scan(ADDRESS);
-  // Seven calls at four a second: the burst takes four, and the other three wait for the budget.
-  assert.ok(time.now() - start >= ((7 - BLOCKSCOUT_CALLS_PER_SECOND) * 1000) / BLOCKSCOUT_CALLS_PER_SECOND - 1);
+  // Nine calls at three a second: the burst takes three, and the other six wait for the budget.
+  assert.ok(time.now() - start >= ((9 - BLOCKSCOUT_CALLS_PER_SECOND) * 1000) / BLOCKSCOUT_CALLS_PER_SECOND - 1);
 });
 
 /** The relay with a scanner that answers from a list, and nothing behind its routes of the bridge. */
