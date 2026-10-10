@@ -20,6 +20,7 @@ import {
   EVM_ADDRESS_PATTERN,
   oldestOf,
   ScanCache,
+  settledFunding,
   sleepFor,
   takeSlot,
   type ChainHolding,
@@ -75,8 +76,8 @@ function transferOf(value: unknown): ChainTransfer | null {
   }
   return {
     hash,
-    from: { address: from, label: null, isContract: false },
-    to: to === null ? null : { address: to, label: null, isContract: false },
+    from: { address: from, label: null, labelSource: null, isContract: false },
+    to: to === null ? null : { address: to, label: null, labelSource: null, isContract: false },
     value: amount,
     token,
     time,
@@ -189,7 +190,8 @@ export class Alchemy implements ChainScanner {
       firstFunding: funding.transfer,
       fundingSure: funding.sure,
     };
-    return this.#named(scan);
+    const settled = settledFunding(funding, scan);
+    return this.#named({ ...scan, firstFunding: settled.transfer, fundingSure: settled.sure });
   }
 
   /**
@@ -222,11 +224,15 @@ export class Alchemy implements ChainScanner {
     } catch {
       return scan;
     }
-    const label = (party: ChainParty) => names.get(party.address.toLowerCase()) ?? party.label;
+    // A name of the metadata service is a tag of type name.
+    const named = (party: ChainParty): ChainParty => {
+      const tag = names.get(party.address.toLowerCase());
+      return tag === undefined ? party : { ...party, label: tag, labelSource: "tag" };
+    };
     const name = (transfer: ChainTransfer): ChainTransfer => ({
       ...transfer,
-      from: { ...transfer.from, label: label(transfer.from) },
-      to: transfer.to === null ? null : { ...transfer.to, label: label(transfer.to) },
+      from: named(transfer.from),
+      to: transfer.to === null ? null : named(transfer.to),
     });
     return {
       ...scan,

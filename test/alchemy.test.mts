@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { Alchemy } from "../src/alchemy.mts";
 import { GatewayError } from "../src/changenow.mts";
 import { ALCHEMY_URL, METADATA_URL, SCAN_CACHE_MS } from "../src/config.mts";
-import type { ChainTransfer, FundingReader } from "../src/scan.mts";
+import { oldestOf, type ChainTransfer, type FundingReader } from "../src/scan.mts";
 
 const KEY = "alchemy_test_key_of_the_relay";
 
@@ -185,6 +185,7 @@ test("scans an address through Alchemy, with the key in a header and never in a 
 test("names the addresses around a scan from the metadata service, and goes on without names when it fails", async () => {
   const named = await new Alchemy(KEY, { fetchImpl: sources().fetchImpl }).scan(ADDRESS);
   assert.equal(named.firstTransaction?.from.label, "Big Exchange", "the tag of type name, not the generic one");
+  assert.equal(named.firstTransaction?.from.labelSource, "tag");
   assert.equal(named.transactions[0].to?.label, null);
   const metadata = sources({ metadataStatus: 500 });
   const plain = await new Alchemy(KEY, { fetchImpl: metadata.fetchImpl }).scan(ADDRESS);
@@ -245,8 +246,8 @@ test("a reader of the first funding gets the transfers in that Alchemy found, an
   const asked: { address: string; known: ChainTransfer[] }[] = [];
   const internal: ChainTransfer = {
     hash: "0xinternal",
-    from: { address: SHOP, label: "Disperse", isContract: true },
-    to: { address: ADDRESS, label: null, isContract: false },
+    from: { address: SHOP, label: "Disperse", labelSource: "contract", isContract: true },
+    to: { address: ADDRESS, label: null, labelSource: null, isContract: false },
     value: "1000",
     token: null,
     time: "2026-09-30T08:00:00.000Z",
@@ -265,7 +266,33 @@ test("a reader of the first funding gets the transfers in that Alchemy found, an
   );
   assert.equal(scan.firstFunding?.hash, "0xinternal");
   assert.equal(scan.firstFunding?.from.label, "Disperse", "a name that the reader gave stays");
+  assert.equal(scan.firstFunding?.from.labelSource, "contract", "with its source");
   assert.equal(scan.fundingSure, true);
+});
+
+test("a reader that found no transfer in leaves the funding unsure for an address that holds ETH", async () => {
+  const funding: FundingReader = {
+    async funding() {
+      return { transfer: null, sure: true };
+    },
+  };
+  const scan = await new Alchemy(KEY, { fetchImpl: sources().fetchImpl, funding }).scan(ADDRESS);
+  assert.equal(scan.balanceWei, "10000000000000000");
+  assert.equal(scan.firstFunding, null);
+  assert.equal(scan.fundingSure, false);
+});
+
+test("a known transfer in without a time that reads is no first funding", async () => {
+  const known: ChainTransfer[] = [];
+  const funding: FundingReader = {
+    async funding(address, found) {
+      known.push(...found);
+      return { transfer: oldestOf([{ ...found[0], time: "not a time" }, ...found.slice(1)]), sure: true };
+    },
+  };
+  const scan = await new Alchemy(KEY, { fetchImpl: sources().fetchImpl, funding }).scan(ADDRESS);
+  assert.equal(known[0].hash, "0xfund");
+  assert.equal(scan.firstFunding?.hash, "0xfirsttoken", "the transfer whose time does not read drops out");
 });
 
 test("a reader that fails leaves the oldest transfer of value in that Alchemy found, unsure", async () => {

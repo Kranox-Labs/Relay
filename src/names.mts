@@ -13,7 +13,9 @@ export async function readNames(fetchImpl: typeof fetch, addresses: string[]): P
   const url = `${METADATA_URL}?${query}`;
   const response = await fetchImpl(url, { redirect: "error", signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
   if (!response.ok) throw new Error("The metadata service failed.");
-  const known = objectOrNull(objectOrNull(await response.json())?.addresses) ?? {};
+  // An answer without its list of addresses names nobody for sure, so it counts as a failure.
+  const known = objectOrNull(objectOrNull(await response.json())?.addresses);
+  if (known === null) throw new Error("The metadata service answered without its addresses.");
   const names = new Map<string, string>();
   for (const [address, value] of Object.entries(known)) {
     const tags = objectOrNull(value)?.tags;

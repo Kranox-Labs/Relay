@@ -1,6 +1,26 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { checkCreationKeys, CREATION_KEY_ENTRIES, CREATION_KEY_MS, UPSTREAM_CALLS_PER_SECOND } from "../src/config.mts";
 import { CreationKeys, CreationKeysFull } from "../src/creations.mts";
+
+test("takes a lifetime and a capacity of whole numbers above zero only", () => {
+  for (const [lifetime, capacity] of [
+    [0, 2],
+    [-1, 2],
+    [Number.NaN, 2],
+    [1_000, 0],
+    [1_000, Number.POSITIVE_INFINITY],
+    [1_000, 2.5],
+  ]) {
+    assert.throws(() => new CreationKeys(lifetime, capacity), /whole numbers above zero/, `${lifetime}, ${capacity}`);
+  }
+});
+
+test("starts only while the creation keys outnumber the calls to ChangeNOW in the lifetime of a key", () => {
+  assert.doesNotThrow(() => checkCreationKeys(UPSTREAM_CALLS_PER_SECOND, CREATION_KEY_MS, CREATION_KEY_ENTRIES));
+  assert.throws(() => checkCreationKeys(40, CREATION_KEY_MS, CREATION_KEY_ENTRIES), /outnumber/);
+  assert.throws(() => checkCreationKeys(UPSTREAM_CALLS_PER_SECOND, Number.NaN, CREATION_KEY_ENTRIES), /outnumber/);
+});
 
 test("forgets a creation after its time, and refuses a new key while it holds too many live ones (O-008)", async () => {
   let now = 0;

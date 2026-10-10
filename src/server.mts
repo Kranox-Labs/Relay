@@ -188,15 +188,24 @@ function pairMatches(created: CreatedExchange, from: Side, to: Side, flow: strin
 }
 
 /**
- * A refund address that ChangeNOW left out passes, and so does any when the request named none; otherwise it must be
- * the one of the request, compared by [same].
+ * Whether ChangeNOW recorded the refund address of the request: the same one, compared by [same], or none when the
+ * request named none.
  */
 function refundMatches(
   created: CreatedExchange,
   requested: string | null,
   same: (a: string, b: string) => boolean,
 ): boolean {
-  return created.refundAddress === null || requested === null || same(created.refundAddress, requested);
+  // The answer of v2 carries the refund address that the request specified (CHECKED 10 Oct 2026, the API
+  // documentation of ChangeNOW: "Refund address (if you specified it)"), so one that it leaves out is no match: the app
+  // would promise a refund that ChangeNOW never recorded (the sharp-edges scan of 10 Oct 2026). An empty one is none.
+  const recorded = recordedRefund(created);
+  return requested === null ? recorded === null : recorded !== null && same(recorded, requested);
+}
+
+/** The refund address that ChangeNOW recorded for a swap, which the relay hands the app to compare (wallet O-003). */
+function recordedRefund(created: CreatedExchange): string | null {
+  return created.refundAddress || null;
 }
 
 const sameText = (a: string, b: string): boolean => a === b;
@@ -324,7 +333,8 @@ async function createSwap(parts: RelayParts, request: IncomingMessage, raw: Buff
     // The app shows the deposit address as a code and the amount as "Send exactly", so the relay passes on only an
     // exchange of the coin and the amount of the request, into the subaddress of the request.
     checkCreated(created, receiveMismatch(created, asset, amount, address, refundAddress));
-    // The app compares the refund address with the one that it sent (wallet O-003 of the second security review).
+    // The app compares the refund address that ChangeNOW recorded with the one that it sent (wallet O-003 of the second
+    // security review).
     return {
       id: created.id,
       asset,
@@ -332,7 +342,7 @@ async function createSwap(parts: RelayParts, request: IncomingMessage, raw: Buff
       estimatedXmr: created.toAmount,
       depositAddress: created.payinAddress,
       payoutAddress: created.payoutAddress,
-      refundAddress,
+      refundAddress: recordedRefund(created),
       readToken: parts.tokens.issue(created.id),
     };
   });
@@ -413,7 +423,8 @@ async function createPay(parts: RelayParts, request: IncomingMessage, raw: Buffe
     const created = await parts.exchanger.createPay(asset, rate, xmrAmount, address, refundAddress, rateId);
     // The app sends XMR to the deposit address and trusts the recipient, so the relay passes on nothing else.
     checkCreated(created, payMismatch(created, asset, rate, xmrAmount, address, refundAddress));
-    // The app compares the refund address with the one that it sent (wallet O-003 of the second security review).
+    // The app compares the refund address that ChangeNOW recorded with the one that it sent (wallet O-003 of the second
+    // security review).
     return {
       id: created.id,
       asset,
@@ -421,7 +432,7 @@ async function createPay(parts: RelayParts, request: IncomingMessage, raw: Buffe
       xmrAmount: created.fromAmount,
       depositAddress: created.payinAddress,
       payoutAddress: created.payoutAddress,
-      refundAddress,
+      refundAddress: recordedRefund(created),
       readToken: parts.tokens.issue(created.id),
     };
   });

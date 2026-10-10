@@ -37,10 +37,31 @@ export interface SignedAnswer {
   body: string;
 }
 
-/** The text that a signature of the second form covers: one field on each line, and the body of the answer last. */
+/**
+ * The text that a signature of the second form covers: one field on each line, and the body of the answer last. No
+ * field before the body may hold a line break, or two answers could share a text (the sharp-edges scan of 10 Oct
+ * 2026), so a field of another form is a fault of the relay.
+ */
 export function answerMessage(answer: SignedAnswer): string {
   const { nonce, method, target, requestHash, status, body } = answer;
-  return [ANSWER_V2, nonce, method, target, requestHash, String(status), body].join("\n");
+  const formed =
+    !/[\r\n]/.test(method) &&
+    !/[\r\n]/.test(target) &&
+    /^[0-9a-f]{64}$/.test(requestHash) &&
+    Number.isInteger(status) &&
+    status >= 100 &&
+    status <= 599;
+  if (!formed) throw new Error("An answer to sign has a field of the wrong form.");
+  return [ANSWER_V2, signedNonce(nonce), method, target, requestHash, String(status), body].join("\n");
+}
+
+/**
+ * [nonce] as a signature takes it: in the form of the app only. Its form holds no line break and no slash, so a text
+ * of the first form never reads as one of the second, and the relay signs nothing over an empty nonce (relay O-004).
+ */
+function signedNonce(nonce: string): string {
+  if (!NONCE_PATTERN.test(nonce)) throw new Error("A nonce to sign does not have the form of the app.");
+  return nonce;
 }
 
 /** The SHA-256 of the body of a request, in hex. */
@@ -62,7 +83,7 @@ export class AnswerSigner {
 
   /** The signature of the first form, in base64, of [body] for the request with [nonce]. */
   sign(nonce: string, body: string): string {
-    return this.#sign(`${nonce}\n${body}`);
+    return this.#sign(`${signedNonce(nonce)}\n${body}`);
   }
 
   /** The signature of the second form, in base64, of an answer to its request. */

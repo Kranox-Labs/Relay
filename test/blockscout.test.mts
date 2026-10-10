@@ -165,7 +165,12 @@ interface Sent {
  */
 function explorer(
   status?: number,
-  { failing = [], names = {} }: { failing?: string[]; names?: Record<string, string> } = {},
+  {
+    failing = [],
+    names = {},
+    answers = [],
+    metadata,
+  }: { failing?: string[]; names?: Record<string, string>; answers?: [string, unknown][]; metadata?: unknown } = {},
 ): { fetchImpl: typeof fetch; sent: Sent[] } {
   const sent: Sent[] = [];
   const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -173,6 +178,7 @@ function explorer(
     sent.push({ url: text, init: init ?? {} });
     if (text.startsWith(METADATA_URL)) {
       if (failing.includes(METADATA_URL)) return new Response("{}", { status: 500 });
+      if (metadata !== undefined) return Response.json(metadata);
       return Response.json({
         addresses: Object.fromEntries(
           Object.entries(names).map(([address, name]) => [
@@ -186,7 +192,7 @@ function explorer(
     // The explorer reads an address in any case of its letters.
     const path = text.replace("https://api.blockscout.com", "").toLowerCase();
     if (failing.some((start) => path.startsWith(start.toLowerCase()))) return new Response("{}", { status: 500 });
-    const answer = ANSWERS.find(([start]) => path.startsWith(start.toLowerCase()));
+    const answer = [...answers, ...ANSWERS].find(([start]) => path.startsWith(start.toLowerCase()));
     return answer === undefined ? new Response("{}", { status: 500 }) : Response.json(answer[1]);
   }) as typeof fetch;
   return { fetchImpl, sent };
@@ -231,20 +237,31 @@ test("reads the public history of an address, with the key in a header and never
     "an item without its fields drops out",
   );
   assert.equal(scan.transactions[2].to, null, "a contract creation has no recipient");
-  assert.deepEqual(scan.transactions[0].to, { address: SHOP, label: "Coffee Shop", isContract: true });
+  assert.deepEqual(scan.transactions[0].to, {
+    address: SHOP,
+    label: "Coffee Shop",
+    labelSource: "contract",
+    isContract: true,
+  });
   assert.deepEqual(scan.tokenTransfers[0].token, { symbol: "USDG", address: USDG, decimals: 6 });
   assert.equal(scan.tokenTransfers[0].value, "25000000");
   assert.deepEqual(scan.holdings, [{ token: { symbol: "USDG", address: USDG, decimals: 6 }, value: "75000000" }]);
   // The oldest transaction comes without names, and takes the name that the newer list knows.
   assert.equal(scan.firstTransaction?.hash, "0xtx1");
   assert.equal(scan.firstTransaction?.from.label, "Big Exchange 1");
+  assert.equal(scan.firstTransaction?.from.labelSource, "tag");
   assert.equal(scan.firstTransaction?.time, "2026-10-01T08:00:00.000Z");
   assert.equal(scan.firstTokenTransfer?.token?.symbol, "USDG");
   assert.equal(scan.firstTokenTransfer?.from.label, "Coffee Shop");
   // The first funding: the oldest transfer of value in, here the ETH that a contract sent, named as the explorer names
   // the contract; a failed transfer and one of nothing fund nothing.
   assert.equal(scan.firstFunding?.hash, "0xinternal");
-  assert.deepEqual(scan.firstFunding?.from, { address: DISPERSE.toLowerCase(), label: "Disperse", isContract: true });
+  assert.deepEqual(scan.firstFunding?.from, {
+    address: DISPERSE.toLowerCase(),
+    label: "Disperse",
+    labelSource: "contract",
+    isContract: true,
+  });
   assert.equal(scan.firstFunding?.time, "2026-09-30T08:00:00.000Z");
   assert.equal(scan.fundingSure, true);
 });
@@ -254,7 +271,28 @@ test("a tag of the metadata service names the first funder before the explorer d
   const time = clock();
   const scan = await new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep }).scan(ADDRESS);
   assert.equal(scan.firstFunding?.from.label, "Disperse: Airdrops");
+  assert.equal(scan.firstFunding?.from.labelSource, "tag");
   assert.equal(scan.fundingSure, true);
+});
+
+test("says where each name comes from: a public tag first, then the name of a contract, then a domain", async () => {
+  const route = `/4663/api/v2/addresses/${DISPERSE}`;
+  const tagged = [{ display_name: "Disperse: Airdrops" }];
+  for (const [fields, label, labelSource] of [
+    [{ ens_domain_name: "airdrop.eth" }, "airdrop.eth", "domain"],
+    [{ name: "Disperse", is_contract: true, ens_domain_name: "airdrop.eth" }, "Disperse", "contract"],
+    [
+      { name: "Disperse", is_contract: true, ens_domain_name: "airdrop.eth", public_tags: tagged },
+      "Disperse: Airdrops",
+      "tag",
+    ],
+  ] as const) {
+    const { fetchImpl } = explorer(undefined, { answers: [[route, party(DISPERSE, fields)]] });
+    const time = clock();
+    const scan = await new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep }).scan(ADDRESS);
+    assert.equal(scan.firstFunding?.from.label, label);
+    assert.equal(scan.firstFunding?.from.labelSource, labelSource, label);
+  }
 });
 
 test("a failed list of internal transfers, or a failed name, leaves the first funding unsure and the scan whole", async () => {
@@ -284,8 +322,8 @@ test("reads the first funding for another source, with the transfers in that it 
   const blockscout = new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep });
   const older = {
     hash: "0xolder",
-    from: { address: SHOP, label: null, isContract: false },
-    to: { address: ADDRESS, label: null, isContract: false },
+    from: { address: SHOP, label: null, labelSource: null, isContract: false },
+    to: { address: ADDRESS, label: null, labelSource: null, isContract: false },
     value: "7",
     token: null,
     time: "2026-08-01T08:00:00.000Z",
@@ -309,6 +347,86 @@ test("an address that the explorer never saw is an empty scan after one call", a
   assert.equal(scan.transactionCount, 0);
   assert.deepEqual(scan.transactions, []);
   assert.equal(scan.firstTransaction, null);
+  assert.equal(scan.fundingSure, false, "an unknown address says nothing for sure of a transfer that it missed");
+});
+
+test("a failure inside a 200, a row that does not read, or names without their list leave the funding unsure", async () => {
+  const internal = "/v2/api?chain_id=4663&module=account&action=txlistinternal";
+  // The explorer knows the funder of the oldest transaction, so that only the answer under test can leave it unsure.
+  const funder: [string, unknown] = [
+    `/4663/api/v2/addresses/${FUNDER}`,
+    party(FUNDER, { public_tags: [{ display_name: "Big Exchange 1" }] }),
+  ];
+  const scanWith = async (answers: [string, unknown][], metadata?: unknown) => {
+    const { fetchImpl } = explorer(undefined, { answers, metadata });
+    const time = clock();
+    return new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep }).scan(ADDRESS);
+  };
+  const empty = { status: "0", message: "No transactions found", result: [] };
+  const fromFunder = await scanWith([[internal, empty], funder]);
+  assert.equal(fromFunder.firstFunding?.hash, "0xtx1");
+  assert.equal(fromFunder.fundingSure, true, "with every list whole, the funder of the oldest transaction is sure");
+  for (const [answers, metadata] of [
+    [[[internal, { status: "0", message: "NOTOK", result: "Error! The request timed out" }], funder], undefined],
+    [
+      [[internal, { status: "1", message: "OK", result: [{ transactionHash: "0xbroken", from: SHOP }] }], funder],
+      undefined,
+    ],
+    [[], { error: "busy" }],
+  ] as [[string, unknown][], unknown][]) {
+    const scan = await scanWith(answers, metadata);
+    assert.equal(scan.fundingSure, false, JSON.stringify(answers) + JSON.stringify(metadata));
+    assert.equal(scan.transactionCount, 12, "the rest of the scan stands");
+  }
+});
+
+test("no transfer in is sure only for an address that shows nothing", async () => {
+  const empty = { status: "0", message: "No transactions found", result: [] };
+  const lists: [string, unknown][] = [
+    ["/v2/api?chain_id=4663&module=account&action=txlistinternal", empty],
+    ["/v2/api?chain_id=4663&module=account&action=txlist", empty],
+    ["/v2/api?chain_id=4663&module=account&action=tokentx", empty],
+  ];
+  // The address holds ETH and sent transactions, so something came in that the explorer missed.
+  const holding = await new Blockscout(KEY, { fetchImpl: explorer(undefined, { answers: lists }).fetchImpl }).scan(
+    ADDRESS,
+  );
+  assert.equal(holding.firstFunding, null);
+  assert.equal(holding.fundingSure, false);
+});
+
+test("a row whose parties are no addresses drops out, and never reaches the path of a call", async () => {
+  const hostile = "../../../v2/api?module=account&action=balance&address=";
+  const { fetchImpl, sent } = explorer(undefined, {
+    answers: [
+      [
+        "/v2/api?chain_id=4663&module=account&action=txlistinternal",
+        {
+          status: "1",
+          message: "OK",
+          result: [
+            { transactionHash: "0xhostile", from: hostile, to: ADDRESS, value: "5", timeStamp: "1790000000" },
+            {
+              transactionHash: "0xinternal",
+              from: DISPERSE.toLowerCase(),
+              to: ADDRESS.toLowerCase(),
+              value: "1000000000000000",
+              timeStamp: "1790755200",
+              isError: "0",
+            },
+          ],
+        },
+      ],
+    ],
+  });
+  const time = clock();
+  const scan = await new Blockscout(KEY, { fetchImpl, now: time.now, sleep: time.sleep }).scan(ADDRESS);
+  assert.equal(scan.firstFunding?.hash, "0xinternal", "the older row whose sender is no address funds nothing");
+  assert.equal(scan.fundingSure, false, "a row that does not read leaves the list incomplete");
+  assert.ok(
+    sent.every((call) => !call.url.includes("..")),
+    "no part of an answer goes into a path",
+  );
 });
 
 test("a refused key or a spent budget reaches the app with a fixed text", async () => {

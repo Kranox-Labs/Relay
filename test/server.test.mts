@@ -53,15 +53,25 @@ const fake: Exchanger = {
   async create(asset: ChainAsset, amount: string, address: string, refundAddress: string | null) {
     calls.push(["create", asset, amount, address, refundAddress]);
     if (amount === "0.001") throw new UpstreamError(400, "Amount is less than minimal");
-    // Five amounts stand for faults of ChangeNOW: another payout address, a deposit address that is not on Robinhood
-    // Chain, another amount, another pair of coins, and another refund address.
+    // Seven amounts stand for faults of ChangeNOW: another payout address, a deposit address that is not on Robinhood
+    // Chain, another amount, another pair of coins, another refund address, a refund address left out, and one that
+    // the request never named. A last one records the refund address in lowercase, as ChangeNOW may.
     return {
       id: "3a2360771439a3",
       fromAmount: amount === "0.0088" ? 0.0089 : Number(amount),
       toAmount: 0.0271,
       payinAddress: amount === "0.0077" ? "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq" : CHAIN_DEPOSIT,
       payoutAddress: amount === "0.0066" ? XMR_DEPOSIT : address,
-      refundAddress: amount === "0.0044" ? RECIPIENT : refundAddress,
+      refundAddress:
+        amount === "0.0044"
+          ? RECIPIENT
+          : amount === "0.0033"
+            ? null
+            : amount === "0.0011"
+              ? RECIPIENT
+              : amount === "0.0022"
+                ? (refundAddress?.toLowerCase() ?? null)
+                : refundAddress,
       ...RECEIVE_PAIR,
       fromCurrency: amount === "0.0099" ? "btc" : asset,
     };
@@ -243,6 +253,7 @@ test("passes on no swap that ChangeNOW made other than the request, and names it
     ["0.0088", "another amount"],
     ["0.0099", "another pair of coins"],
     ["0.0044", "another refund address"],
+    ["0.0033", "another refund address"],
   ]) {
     const request = { asset: "eth", amount, address: MAINNET_SUBADDRESS, refundAddress: REFUND_ADDRESS };
     const [status, body] = await json("/v1/receive/swaps", post(request));
@@ -250,6 +261,21 @@ test("passes on no swap that ChangeNOW made other than the request, and names it
     assert.match(String(body.error), new RegExp(reason), amount);
     assert.equal(body.exchangeId, "3a2360771439a3", amount);
   }
+});
+
+test("answers the refund address that ChangeNOW recorded, and none that the request never named", async () => {
+  const [status, body] = await json(
+    "/v1/receive/swaps",
+    post({ asset: "eth", amount: "0.0022", address: MAINNET_SUBADDRESS, refundAddress: REFUND_ADDRESS }),
+  );
+  assert.equal(status, 201);
+  assert.equal(body.refundAddress, REFUND_ADDRESS.toLowerCase(), "the app compares what ChangeNOW keeps");
+  const [unasked, unaskedBody] = await json(
+    "/v1/receive/swaps",
+    post({ asset: "eth", amount: "0.0011", address: MAINNET_SUBADDRESS }),
+  );
+  assert.equal(unasked, 502);
+  assert.match(String(unaskedBody.error), /another refund address/);
 });
 
 test("refuses a request from a web page", async () => {
@@ -607,6 +633,31 @@ test("signs nothing for a request without a nonce, as from an app before 0.3.1 (
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("kranox-signature"), null);
     assert.equal(response.headers.get("kranox-signature-v2"), null);
+  }
+});
+
+test("signs no text whose fields could shift: a nonce of another form, or a line break before the body", () => {
+  const signer = new AnswerSigner(signingKeys.privateKey.export({ type: "pkcs8", format: "pem" }).toString());
+  const answer = {
+    nonce: "00112233445566778899aabbccddeeff",
+    method: "GET",
+    target: "/health",
+    requestHash: requestHash(Buffer.alloc(0)),
+    status: 200,
+    body: "{}",
+  };
+  assert.doesNotThrow(() => signer.signAnswer(answer));
+  for (const nonce of ["", "kranox/answer/2", "00112233445566778899aabbccddeeff\nGET"]) {
+    assert.throws(() => signer.sign(nonce, "{}"), /nonce/, JSON.stringify(nonce));
+    assert.throws(() => signer.signAnswer({ ...answer, nonce }), /nonce/, JSON.stringify(nonce));
+  }
+  for (const [field, value] of [
+    ["method", "GET\n/health"],
+    ["target", "/health\r\n"],
+    ["requestHash", "nothex"],
+    ["status", 2000],
+  ] as const) {
+    assert.throws(() => signer.signAnswer({ ...answer, [field]: value }), /wrong form/, field);
   }
 });
 
