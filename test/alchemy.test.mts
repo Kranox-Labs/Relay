@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { Alchemy } from "../src/alchemy.mts";
 import { GatewayError } from "../src/changenow.mts";
 import { ALCHEMY_URL, METADATA_URL, SCAN_CACHE_MS } from "../src/config.mts";
+import type { ChainTransfer, FundingReader } from "../src/scan.mts";
 
 const KEY = "alchemy_test_key_of_the_relay";
 
@@ -231,4 +232,50 @@ test("keeps a scan for a while, so that a second look spends no call", async () 
   time.advance(SCAN_CACHE_MS);
   await alchemy.scan(ADDRESS);
   assert.equal(asked.length, calls * 2);
+});
+
+test("without a reader of the first funding, the oldest transfer of value in is the funding, and unsure", async () => {
+  const scan = await new Alchemy(KEY, { fetchImpl: sources().fetchImpl }).scan(ADDRESS);
+  assert.equal(scan.firstFunding?.hash, "0xfund");
+  assert.equal(scan.firstFunding?.from.label, "Big Exchange", "named from the metadata service");
+  assert.equal(scan.fundingSure, false, "Alchemy reads no internal transfer on this network");
+});
+
+test("a reader of the first funding gets the transfers in that Alchemy found, and its answer stands", async () => {
+  const asked: { address: string; known: ChainTransfer[] }[] = [];
+  const internal: ChainTransfer = {
+    hash: "0xinternal",
+    from: { address: SHOP, label: "Disperse", isContract: true },
+    to: { address: ADDRESS, label: null, isContract: false },
+    value: "1000",
+    token: null,
+    time: "2026-09-30T08:00:00.000Z",
+  };
+  const funding: FundingReader = {
+    async funding(address, known) {
+      asked.push({ address, known });
+      return { transfer: internal, sure: true };
+    },
+  };
+  const scan = await new Alchemy(KEY, { fetchImpl: sources().fetchImpl, funding }).scan(ADDRESS);
+  assert.equal(asked.length, 1);
+  assert.deepEqual(
+    asked[0].known.map((transfer) => transfer.hash),
+    ["0xfund", "0xfirsttoken"],
+  );
+  assert.equal(scan.firstFunding?.hash, "0xinternal");
+  assert.equal(scan.firstFunding?.from.label, "Disperse", "a name that the reader gave stays");
+  assert.equal(scan.fundingSure, true);
+});
+
+test("a reader that fails leaves the oldest transfer of value in that Alchemy found, unsure", async () => {
+  const funding: FundingReader = {
+    async funding() {
+      throw new GatewayError(503, "Blockscout is busy. Try again in a minute.");
+    },
+  };
+  const scan = await new Alchemy(KEY, { fetchImpl: sources().fetchImpl, funding }).scan(ADDRESS);
+  assert.equal(scan.firstFunding?.hash, "0xfund");
+  assert.equal(scan.fundingSure, false);
+  assert.equal(scan.transactionCount, 7, "the rest of the scan stands");
 });

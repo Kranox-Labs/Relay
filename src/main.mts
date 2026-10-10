@@ -12,11 +12,12 @@ import { SwapTokens } from "./tokens.mts";
 
 const config = loadConfig();
 // The scan reads Alchemy first and Blockscout when Alchemy fails, such as when its budget is spent; with one key it
-// reads that source alone, and without a key it cannot scan.
-const sources = [
-  ...(config.alchemyApiKey === null ? [] : [new Alchemy(config.alchemyApiKey)]),
-  ...(config.blockscoutApiKey === null ? [] : [new Blockscout(config.blockscoutApiKey)]),
-];
+// reads that source alone, and without a key it cannot scan. Alchemy reads no internal transfer here, so Blockscout
+// also reads the first funding of each scan of Alchemy.
+const blockscout = config.blockscoutApiKey === null ? null : new Blockscout(config.blockscoutApiKey);
+const alchemy =
+  config.alchemyApiKey === null ? null : new Alchemy(config.alchemyApiKey, { funding: blockscout ?? undefined });
+const sources = [...(alchemy === null ? [] : [alchemy]), ...(blockscout === null ? [] : [blockscout])];
 const scanner = sources.length === 0 ? null : sources.length === 1 ? sources[0] : new FallbackScanner(sources);
 const relay = createRelay({
   exchanger: new ChangeNow(config.changenowApiKey),

@@ -52,10 +52,57 @@ export interface ChainScan {
   transactions: ChainTransfer[];
   tokenTransfers: ChainTransfer[];
   holdings: ChainHolding[];
+  /**
+   * The oldest transfer of value into the address that the relay found: of ETH, of ETH that a contract sent (an
+   * internal transfer), or of a token, with the public name of its sender and whether that sender is a contract. Null
+   * when it found none. From 10 Oct 2026: the oldest transaction and token transfer above may go out, and miss the
+   * internal transfers, so the app reads the first funding from here.
+   */
+  firstFunding: ChainTransfer | null;
+  /**
+   * Whether the relay read every kind of transfer in and the name of the sender of [firstFunding]. A source that cannot
+   * read internal transfers, or a call that failed, leaves it unsure. The explorer of Robinhood Chain still misses some
+   * internal transfers everywhere, which the app tells the user.
+   */
+  fundingSure: boolean;
 }
 
 export interface ChainScanner {
   scan(address: string): Promise<ChainScan>;
+}
+
+/** The oldest transfer of value into an address that a reader found, and whether it read every kind of transfer in. */
+export interface Funding {
+  transfer: ChainTransfer | null;
+  sure: boolean;
+}
+
+/**
+ * Reads the first funding of an address from every kind of transfer in, so that the scan of a source that cannot read
+ * them all, such as Alchemy without internal transfers, can rely on it. [known] holds transfers in that the source of
+ * the scan found already.
+ */
+export interface FundingReader {
+  funding(address: string, known: ChainTransfer[]): Promise<Funding>;
+}
+
+/** Whether [transfer] brought something of value into [address]: a transfer of nothing, such as a fake, funds nothing. */
+export function bringsValue(transfer: ChainTransfer, address: string): boolean {
+  return (
+    transfer.to !== null &&
+    transfer.to.address.toLowerCase() === address.toLowerCase() &&
+    /^[0-9]+$/.test(transfer.value) &&
+    BigInt(transfer.value) > 0n
+  );
+}
+
+/** The oldest of [transfers], or null without any. */
+export function oldestOf(transfers: ChainTransfer[]): ChainTransfer | null {
+  let oldest: ChainTransfer | null = null;
+  for (const transfer of transfers) {
+    if (oldest === null || Date.parse(transfer.time) < Date.parse(oldest.time)) oldest = transfer;
+  }
+  return oldest;
 }
 
 /** The newest scans, so that a second look at an address within [SCAN_CACHE_MS] spends no call. */

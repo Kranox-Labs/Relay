@@ -100,6 +100,12 @@ export const SCAN_SOURCE_PAUSE_MS = 10 * 60_000;
 /** A scan reads at most this many recent transfers in each direction. */
 export const SCAN_RECENT_TRANSFERS = 50;
 
+/**
+ * A scan reads at most this many of the oldest transfers of each kind to find the first one in: an address sends only
+ * after its first ETH came in, so that transfer stands among the oldest ones, after a few failed or empty ones at most.
+ */
+export const SCAN_FUNDING_ROWS = 10;
+
 /** The relay keeps the scan of an address for this long, so that a second look spends no call. */
 export const SCAN_CACHE_MS = 10 * 60_000;
 
