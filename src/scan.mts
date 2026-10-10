@@ -7,10 +7,19 @@ import type { CallLimiter } from "./limiter.mts";
 /** An address on Robinhood Chain, an EVM chain: 0x and 40 hex digits. */
 export const EVM_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 
-/** One side of a transfer, with the public name of the address, if any. */
+/**
+ * Where the public name of an address comes from: a tag of the explorer or of its metadata service, such as the hot
+ * wallet of an exchange; the name of a verified contract, which says what its code does, not who calls it; or a
+ * domain, which the owner of the address chose and nobody checked. The app words each one in its own way (the
+ * sharp-edges scan of 10 Oct 2026).
+ */
+export type LabelSource = "tag" | "contract" | "domain";
+
+/** One side of a transfer, with the public name of the address, if any, and where that name comes from. */
 export interface ChainParty {
   address: string;
   label: string | null;
+  labelSource: LabelSource | null;
   isContract: boolean;
 }
 
@@ -96,13 +105,30 @@ export function bringsValue(transfer: ChainTransfer, address: string): boolean {
   );
 }
 
-/** The oldest of [transfers], or null without any. */
+/** The oldest of [transfers], or null without any. A transfer without a time that reads is no candidate. */
 export function oldestOf(transfers: ChainTransfer[]): ChainTransfer | null {
   let oldest: ChainTransfer | null = null;
   for (const transfer of transfers) {
-    if (oldest === null || Date.parse(transfer.time) < Date.parse(oldest.time)) oldest = transfer;
+    const time = Date.parse(transfer.time);
+    if (!Number.isFinite(time)) continue;
+    if (oldest === null || time < Date.parse(oldest.time)) oldest = transfer;
   }
   return oldest;
+}
+
+/**
+ * [funding] as far as a scan may claim it. No transfer in that the relay found is sure only for an address that shows
+ * nothing: one that holds coins or sent anything got something in first, which the explorer then missed, as it still
+ * misses some internal transfers (the sharp-edges scan of 10 Oct 2026).
+ */
+export function settledFunding(
+  funding: Funding,
+  scan: Pick<ChainScan, "balanceWei" | "transactionCount" | "tokenTransferCount" | "holdings">,
+): Funding {
+  if (funding.transfer !== null || !funding.sure) return funding;
+  const balance = /^[0-9]+$/.test(scan.balanceWei) ? BigInt(scan.balanceWei) : 0n;
+  const shows = balance > 0n || scan.transactionCount > 0 || scan.tokenTransferCount > 0 || scan.holdings.length > 0;
+  return shows ? { transfer: null, sure: false } : funding;
 }
 
 /** The newest scans, so that a second look at an address within [SCAN_CACHE_MS] spends no call. */

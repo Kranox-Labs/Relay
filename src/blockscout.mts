@@ -21,8 +21,10 @@ import { CallLimiter } from "./limiter.mts";
 import { readNames } from "./names.mts";
 import {
   bringsValue,
+  EVM_ADDRESS_PATTERN,
   oldestOf,
   ScanCache,
+  settledFunding,
   sleepFor,
   takeSlot,
   type ChainParty,
@@ -54,7 +56,8 @@ function emptyScan(address: string): ChainScan {
     tokenTransfers: [],
     holdings: [],
     firstFunding: null,
-    fundingSure: true,
+    // The explorer has never seen the address, which says nothing for sure of a transfer that it missed.
+    fundingSure: false,
   };
 }
 
@@ -74,23 +77,27 @@ function count(value: unknown): number {
   return Number.isInteger(number) && number >= 0 ? number : 0;
 }
 
-function labelOf(party: Json): string | null {
+/**
+ * The public name of a party of the explorer and where it comes from: a public tag first, which the explorer keeps,
+ * then the name of the explorer, which is the name of the code for a verified contract, then a domain.
+ */
+function labelOf(party: Json): Pick<ChainParty, "label" | "labelSource"> {
   const tags = Array.isArray(party.public_tags) ? party.public_tags : [];
   const tag = tags.map((item) => objectOrNull(item)).find((item) => item !== null);
-  return (
-    stringOrNull(party.name) ??
-    stringOrNull(party.ens_domain_name) ??
-    stringOrNull(tag?.display_name) ??
-    stringOrNull(tag?.label) ??
-    null
-  );
+  const tagName = stringOrNull(tag?.display_name) ?? stringOrNull(tag?.label);
+  if (tagName !== null) return { label: tagName, labelSource: "tag" };
+  const name = stringOrNull(party.name);
+  if (name !== null) return { label: name, labelSource: party.is_contract === true ? "contract" : "tag" };
+  const domain = stringOrNull(party.ens_domain_name);
+  if (domain !== null) return { label: domain, labelSource: "domain" };
+  return { label: null, labelSource: null };
 }
 
 function partyOf(value: unknown): ChainParty | null {
   const party = objectOrNull(value);
   const address = stringOrNull(party?.hash);
   if (party === null || address === null) return null;
-  return { address, label: labelOf(party), isContract: party.is_contract === true };
+  return { address, ...labelOf(party), isContract: party.is_contract === true };
 }
 
 function tokenOf(value: unknown): ChainToken | null {
@@ -125,23 +132,45 @@ function tokenTransferOf(value: unknown): ChainTransfer | null {
   return { hash, from, to, value: amount, token, time };
 }
 
-/**
- * The rows of an answer in the style of Etherscan, of txlist, txlistinternal, or tokentx, the oldest first, as
- * transfers without names. A failed row moved nothing, so it drops out.
- */
-function etherscanRowsOf(data: Json, withToken: boolean): ChainTransfer[] {
-  const rows = Array.isArray(data.result) ? data.result : [];
-  return rows.map((row) => etherscanRowOf(row, withToken)).filter((row): row is ChainTransfer => row !== null);
+/** The rows of an answer in the style of Etherscan, and whether the answer holds every one of them. */
+interface Rows {
+  rows: ChainTransfer[];
+  complete: boolean;
 }
 
-/** A row in the style of Etherscan as a transfer without names; an internal row names its transaction transactionHash. */
+/**
+ * The rows of an answer in the style of Etherscan, of txlist, txlistinternal, or tokentx, the oldest first, as
+ * transfers without names. A failed row moved nothing, so it drops out. The API answers a failure inside a 200, with a
+ * text in place of the rows, and a row that does not read may hide a transfer in: either leaves the list incomplete
+ * (the sharp-edges scan of 10 Oct 2026).
+ */
+function etherscanRowsOf(data: Json, withToken: boolean): Rows {
+  if (!Array.isArray(data.result)) return { rows: [], complete: false };
+  const rows: ChainTransfer[] = [];
+  let complete = true;
+  for (const value of data.result) {
+    if (objectOrNull(value)?.isError === "1") continue;
+    const row = etherscanRowOf(value, withToken);
+    if (row === null) complete = false;
+    else rows.push(row);
+  }
+  return { rows, complete };
+}
+
+/**
+ * A row in the style of Etherscan as a transfer without names; an internal row names its transaction transactionHash.
+ * Its parties must be addresses, since the sender of a first funding goes into the path of a call with the key.
+ */
 function etherscanRowOf(value: unknown, withToken: boolean): ChainTransfer | null {
   const row = objectOrNull(value);
   const hash = stringOrNull(row?.hash) ?? stringOrNull(row?.transactionHash);
   const from = stringOrNull(row?.from);
   const seconds = Number(stringOrNull(row?.timeStamp) ?? NaN);
-  if (row === null || hash === null || from === null || !Number.isFinite(seconds) || row.isError === "1") return null;
-  const to = stringOrNull(row.to);
+  if (row === null || hash === null || from === null || !Number.isFinite(seconds)) return null;
+  if (!EVM_ADDRESS_PATTERN.test(from)) return null;
+  // A contract creation names no recipient: an empty text, or none.
+  const to = stringOrNull(row.to) || null;
+  if (to !== null && !EVM_ADDRESS_PATTERN.test(to)) return null;
   const decimals = Number(stringOrNull(row.tokenDecimal) ?? NaN);
   const symbol = stringOrNull(row.tokenSymbol);
   const contract = stringOrNull(row.contractAddress);
@@ -152,8 +181,8 @@ function etherscanRowOf(value: unknown, withToken: boolean): ChainTransfer | nul
   if (withToken && token === null) return null;
   return {
     hash,
-    from: { address: from, label: null, isContract: false },
-    to: to === null ? null : { address: to, label: null, isContract: false },
+    from: { address: from, label: null, labelSource: null, isContract: false },
+    to: to === null ? null : { address: to, label: null, labelSource: null, isContract: false },
     value: stringOrNull(row.value) ?? "0",
     token,
     time: new Date(seconds * 1000).toISOString(),
@@ -173,7 +202,16 @@ function named(transfer: ChainTransfer | null, labels: Map<string, ChainParty>):
 
 /** The path of the oldest rows of [action] for [address], in the style of Etherscan. */
 function oldestPath(address: string, action: string): string {
-  return `/v2/api?chain_id=${ROBINHOOD_CHAIN_ID}&module=account&action=${action}&address=${address}&sort=asc&page=1&offset=${SCAN_FUNDING_ROWS}`;
+  const query = new URLSearchParams({
+    chain_id: String(ROBINHOOD_CHAIN_ID),
+    module: "account",
+    action,
+    address,
+    sort: "asc",
+    page: "1",
+    offset: String(SCAN_FUNDING_ROWS),
+  });
+  return `/v2/api?${query}`;
 }
 
 export class Blockscout implements ChainScanner, FundingReader {
@@ -250,12 +288,13 @@ export class Blockscout implements ChainScanner, FundingReader {
     });
     const oldTransactions = etherscanRowsOf(oldestTransactions, false);
     const oldTokenTransfers = etherscanRowsOf(oldestTokenTransfers, true);
-    const firstTransaction = oldTransactions[0] ?? null;
-    const firstTokenTransfer = oldTokenTransfers[0] ?? null;
+    const oldInternal = internal === null ? null : etherscanRowsOf(internal, false);
+    const firstTransaction = oldTransactions.rows[0] ?? null;
+    const firstTokenTransfer = oldTokenTransfers.rows[0] ?? null;
     const funding = await this.#fundingOf(
       address,
-      [...oldTransactions, ...oldTokenTransfers, ...(internal === null ? [] : etherscanRowsOf(internal, false))],
-      internal !== null,
+      [...oldTransactions.rows, ...oldTokenTransfers.rows, ...(oldInternal?.rows ?? [])],
+      oldTransactions.complete && oldTokenTransfers.complete && oldInternal !== null && oldInternal.complete,
     );
     const labels = new Map<string, ChainParty>();
     for (const transfer of [...transactions, ...tokenTransfers]) {
@@ -264,7 +303,7 @@ export class Blockscout implements ChainScanner, FundingReader {
           labels.set(party.address.toLowerCase(), party);
       }
     }
-    return {
+    const scan = {
       address: stringOrNull(info.hash) ?? address,
       isContract: info.is_contract === true,
       balanceWei: stringOrNull(info.coin_balance) ?? "0",
@@ -276,9 +315,9 @@ export class Blockscout implements ChainScanner, FundingReader {
       transactions,
       tokenTransfers,
       holdings,
-      firstFunding: funding.transfer,
-      fundingSure: funding.sure,
     };
+    const settled = settledFunding(funding, scan);
+    return { ...scan, firstFunding: settled.transfer, fundingSure: settled.sure };
   }
 
   /**
@@ -294,8 +333,8 @@ export class Blockscout implements ChainScanner, FundingReader {
     const lists = await Promise.all([read("txlist", false), read("tokentx", true), read("txlistinternal", false)]);
     return this.#fundingOf(
       address,
-      [...known, ...lists.flatMap((list) => list ?? [])],
-      lists.every((list) => list !== null),
+      [...known, ...lists.flatMap((list) => list?.rows ?? [])],
+      lists.every((list) => list !== null && list.complete),
     );
   }
 
@@ -317,16 +356,20 @@ export class Blockscout implements ChainScanner, FundingReader {
    */
   async #sender(party: ChainParty): Promise<{ party: ChainParty; sure: boolean }> {
     const [info, names] = await Promise.all([
-      this.#call(`/${ROBINHOOD_CHAIN_ID}/api/v2/addresses/${party.address}`).then(
+      this.#call(`/${ROBINHOOD_CHAIN_ID}/api/v2/addresses/${encodeURIComponent(party.address)}`).then(
         (data) => partyOf(data),
         // An address that the explorer never saw has no name there, and that is an answer.
-        (error: unknown) => (error instanceof NotFound ? { ...party, label: null } : null),
+        (error: unknown) => (error instanceof NotFound ? { ...party, label: null, labelSource: null } : null),
       ),
       readNames(this.#fetch, [party.address]).catch(() => null),
     ]);
-    const label = names?.get(party.address.toLowerCase()) ?? info?.label ?? null;
+    const tag = names?.get(party.address.toLowerCase());
+    const { label, labelSource } =
+      tag === undefined
+        ? { label: info?.label ?? null, labelSource: info?.labelSource ?? null }
+        : { label: tag, labelSource: "tag" as const };
     return {
-      party: { address: party.address, label, isContract: info?.isContract ?? party.isContract },
+      party: { address: party.address, label, labelSource, isContract: info?.isContract ?? party.isContract },
       sure: info !== null && names !== null,
     };
   }

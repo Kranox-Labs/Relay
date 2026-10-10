@@ -16,7 +16,7 @@ export interface RelayConfig {
   answerSigningKey: string;
 }
 
-/** The API of ChangeNOW. v1 serves the minimum and the estimate with a standard key; v2 makes and reads exchanges. */
+/** The API of ChangeNOW, whose v2 serves every range, estimate, and exchange of the relay. */
 export const CHANGENOW_BASE_URL = "https://api.changenow.io";
 
 /** A call to ChangeNOW that takes longer than this fails, so that the app does not wait without end. */
@@ -129,6 +129,16 @@ export const SWAP_TOKENS_REQUIRED = false;
 export const CREATION_KEY_MS = 10 * 60_000;
 export const CREATION_KEY_ENTRIES = 20_000;
 
+/**
+ * Checks the sum above, which the relay does as it starts: a budget of calls or a lifetime of a key that grows past
+ * the entries could fill the store with real exchanges, which then refuses the retry of a user.
+ */
+export function checkCreationKeys(callsPerSecond: number, lifetimeMs: number, entries: number): void {
+  if (!(callsPerSecond * (lifetimeMs / 1000) < entries)) {
+    throw new Error("The creation keys must outnumber the calls to ChangeNOW in the lifetime of a key.");
+  }
+}
+
 const HIGHEST_PORT = 65_535;
 
 function required(name: string): string {
@@ -171,6 +181,7 @@ function readPem(name: string): string {
 }
 
 export function loadConfig(): RelayConfig {
+  checkCreationKeys(UPSTREAM_CALLS_PER_SECOND, CREATION_KEY_MS, CREATION_KEY_ENTRIES);
   const port = Number(required("RELAY_PORT"));
   if (!Number.isInteger(port) || port < 1 || port > HIGHEST_PORT) {
     throw new Error(`RELAY_PORT must be a whole number from 1 to ${HIGHEST_PORT}.`);

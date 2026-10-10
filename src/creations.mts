@@ -30,7 +30,15 @@ export class CreationKeys {
   readonly #now: () => number;
   readonly #creations = new Map<string, Creation>();
 
+  /**
+   * Keeps each creation [lifetimeMs] and at most [capacity] at once, both whole numbers above zero: a lifetime of zero
+   * lets the retry of a lost answer make a second exchange, and a capacity of zero refuses every key, while a value
+   * that is no number turns either limit off (the sharp-edges scan of 10 Oct 2026).
+   */
   constructor(lifetimeMs: number, capacity: number, now: () => number = Date.now) {
+    if (!Number.isSafeInteger(lifetimeMs) || lifetimeMs <= 0 || !Number.isSafeInteger(capacity) || capacity <= 0) {
+      throw new Error("The lifetime and the capacity of the creation keys must be whole numbers above zero.");
+    }
     this.#lifetimeMs = lifetimeMs;
     this.#capacity = capacity;
     this.#now = now;
