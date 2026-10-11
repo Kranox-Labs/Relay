@@ -480,6 +480,7 @@ async function relayWith(scanner: ChainScanner | null): Promise<{ base: string; 
     scanner,
     tokens: new SwapTokens("a secret of the test"),
     creations: new CreationKeys(60_000, 10),
+    allowedOrigins: [],
     signer: new AnswerSigner(
       generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
     ),

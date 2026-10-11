@@ -25,6 +25,9 @@ const XMR_DEPOSIT = "48PFnHrr8bVGx463yo8SMXGZUp7PyYPgwZJR4MnpgjKCDXpw3XvK6UTbarK
 // A deposit address of ChangeNOW on Robinhood Chain for receive.
 const CHAIN_DEPOSIT = "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984";
 
+// The origin of the web app of Kranox in the test, which the relay answers from a browser.
+const APP_ORIGIN = "https://app.example";
+
 const RECEIVE_PAIR = { fromNetwork: "hood", toCurrency: "xmr", toNetwork: "xmr", flow: "standard" };
 
 const calls: unknown[][] = [];
@@ -150,6 +153,7 @@ const relay = createRelay({
   tokens,
   creations: new CreationKeys(60_000, 100),
   signer: new AnswerSigner(signingKeys.privateKey.export({ type: "pkcs8", format: "pem" }).toString()),
+  allowedOrigins: [APP_ORIGIN],
 });
 let base = "";
 
@@ -290,6 +294,117 @@ test("refuses a request from a web page", async () => {
   });
   assert.equal(fetchMetadata, 403);
   assert.deepEqual(calls, [], "no call reaches ChangeNOW");
+});
+
+test("answers the question of a browser about a request of the web app, and nobody else's", async () => {
+  const asked = await fetch(`${base}/v1/pay/swaps`, {
+    method: "OPTIONS",
+    headers: { origin: APP_ORIGIN, "access-control-request-method": "POST" },
+  });
+  assert.equal(asked.status, 204);
+  assert.equal(asked.headers.get("access-control-allow-origin"), APP_ORIGIN);
+  assert.equal(asked.headers.get("access-control-allow-methods"), "GET, POST");
+  assert.equal(
+    asked.headers.get("access-control-allow-headers"),
+    "content-type, kranox-nonce, idempotency-key, kranox-swap-token",
+  );
+  assert.equal(asked.headers.get("vary"), "origin");
+  const otherPage = await fetch(`${base}/v1/pay/swaps`, {
+    method: "OPTIONS",
+    headers: { origin: "https://evil.example", "access-control-request-method": "POST" },
+  });
+  assert.equal(otherPage.status, 403);
+  assert.equal(otherPage.headers.get("access-control-allow-origin"), null);
+  const nobody = await fetch(`${base}/v1/pay/swaps`, { method: "OPTIONS" });
+  assert.equal(nobody.status, 404);
+});
+
+test("answers a refused page without the headers of the web app, and needs a nonce from the web app", async () => {
+  calls.length = 0;
+  const refused = await fetch(`${base}/v1/pay/range?asset=eth&rate=fixed`, {
+    headers: { origin: "https://evil.example" },
+  });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.headers.get("access-control-allow-origin"), null);
+  assert.equal(refused.headers.get("access-control-expose-headers"), null);
+  assert.equal(refused.headers.get("vary"), "origin");
+  const withoutNonce = await fetch(`${base}/v1/pay/range?asset=eth&rate=fixed`, { headers: { origin: APP_ORIGIN } });
+  assert.equal(withoutNonce.status, 400);
+  assert.match(((await withoutNonce.json()) as { error: string }).error, /needs its nonce/);
+  const shortNonce = await fetch(`${base}/v1/pay/range?asset=eth&rate=fixed`, {
+    headers: { origin: APP_ORIGIN, "kranox-nonce": "short" },
+  });
+  assert.equal(shortNonce.status, 400);
+  assert.deepEqual(calls, [], "no call reaches ChangeNOW");
+});
+
+test("refuses an origin of the web app that no browser sends, before it listens", () => {
+  const parts = {
+    exchanger: fake,
+    scanner: null,
+    tokens,
+    creations: new CreationKeys(60_000, 100),
+    signer: new AnswerSigner(signingKeys.privateKey.export({ type: "pkcs8", format: "pem" }).toString()),
+  };
+  for (const origins of [["null"], ["http://app.example"], ["https://app.example/"], ["https://APP.example"]]) {
+    assert.throws(() => createRelay({ ...parts, allowedOrigins: origins }), /origins of the web app/, origins.join());
+  }
+});
+
+test("matches the origin of the web app exactly", async () => {
+  calls.length = 0;
+  // A page in a sandbox or after a redirect sends the origin "null"; others differ in case, port, or scheme only.
+  for (const origin of [
+    "null",
+    "https://APP.example",
+    "https://app.example:443",
+    "http://app.example",
+    "https://app.example.evil",
+  ]) {
+    const [status] = await json("/v1/pay/range?asset=eth&rate=fixed", { headers: { origin } });
+    assert.equal(status, 403, origin);
+  }
+  assert.deepEqual(calls, [], "no call reaches ChangeNOW");
+});
+
+test("lets the web app read an answer with its signatures, and keeps other pages out", async () => {
+  calls.length = 0;
+  const nonce = "nonce-of-the-web-app-1";
+  const target = "/v1/pay/range?asset=eth&rate=fixed";
+  const response = await fetch(`${base}${target}`, { headers: { origin: APP_ORIGIN, "kranox-nonce": nonce } });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("access-control-allow-origin"), APP_ORIGIN);
+  assert.equal(response.headers.get("access-control-expose-headers"), "kranox-signature, kranox-signature-v2");
+  assert.equal(response.headers.get("vary"), "origin");
+  const body = await response.text();
+  const message = answerMessage({
+    nonce,
+    method: "GET",
+    target,
+    requestHash: requestHash(Buffer.alloc(0)),
+    status: 200,
+    body,
+  });
+  assert.ok(signedBy(message, response.headers.get("kranox-signature-v2")), "the answer carries its signature");
+  const created = await fetch(`${base}/v1/pay/swaps`, {
+    ...post({ asset: "eth", rate: "floating", xmrAmount: "0.5", address: RECIPIENT, refundAddress: XMR_DEPOSIT }),
+    headers: {
+      "content-type": "application/json",
+      origin: APP_ORIGIN,
+      "kranox-nonce": "nonce-of-the-web-app-2",
+      "idempotency-key": "web-app-creation-0001",
+    },
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.headers.get("access-control-allow-origin"), APP_ORIGIN);
+  const [otherPage] = await json("/v1/pay/range?asset=eth&rate=fixed", {
+    headers: { origin: "https://evil.example" },
+  });
+  assert.equal(otherPage, 403);
+  assert.deepEqual(calls, [
+    ["payRange", "eth", "fixed"],
+    ["createPay", "eth", "floating", "0.5", RECIPIENT, XMR_DEPOSIT, null],
+  ]);
 });
 
 test("takes a body only as JSON, as the app sends it", async () => {

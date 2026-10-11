@@ -21,6 +21,7 @@ import {
   MAX_BODY_BYTES,
   MAX_FORWARDED_MESSAGE_CHARS,
   SWAP_TOKENS_REQUIRED,
+  checkOrigin,
 } from "./config.mts";
 import {
   CREATION_KEY_HEADER,
@@ -40,13 +41,15 @@ import {
 import { SWAP_TOKEN_HEADER, type SwapTokens } from "./tokens.mts";
 
 /** The parts of the relay: the exchanger, the scanner of addresses when the relay has a key for one, the read tokens
- * of swaps, and the creations under the keys of the app. */
+ * of swaps, the creations under the keys of the app, the signer of the answers, and the origins of the web app. */
 export interface RelayParts {
   exchanger: Exchanger;
   scanner: ChainScanner | null;
   tokens: SwapTokens;
   creations: CreationKeys;
   signer: AnswerSigner;
+  /** The origins of the web app, which the relay answers from a browser; none keeps every web page out. */
+  allowedOrigins: readonly string[];
 }
 
 /** An amount as the app writes it: digits, and at most 18 decimals after a point. */
@@ -78,6 +81,20 @@ const REFUSAL_STATUSES = new Set([400, 404, 422]);
 /** The coin of Monero in the names of v2, for the checks of a created exchange. */
 const XMR_NAME = "xmr";
 
+/**
+ * What a browser asks before a request of the web app, and what it may read of the answer: the headers that the app
+ * sends, and the signatures of the answer, which a browser keeps from a page unless the relay names them.
+ */
+const REQUEST_HEADERS_ALLOWED = ["content-type", NONCE_HEADER, CREATION_KEY_HEADER, SWAP_TOKEN_HEADER].join(", ");
+const ANSWER_HEADERS_EXPOSED = [SIGNATURE_HEADER, SIGNATURE_V2_HEADER].join(", ");
+const METHODS_ALLOWED = "GET, POST";
+
+/** A browser keeps the answer to its question about a request this long, in seconds. */
+const PREFLIGHT_MAX_AGE_S = 600;
+
+/** The text of a refusal of a web page. */
+const PAGE_REFUSED = "The relay answers the Kranox app only.";
+
 class RequestError extends Error {
   readonly status: number;
 
@@ -90,15 +107,45 @@ class RequestError extends Error {
 /** The headers of the signatures of an answer with [status] and the text [body]. */
 type Signatures = (status: number, body: string) => Record<string, string>;
 
-/** Sends [body] as JSON with its [signatures]. */
-function send(response: ServerResponse, status: number, body: unknown, signatures: Signatures): void {
+/** Sends [body] as JSON with its [signatures], and, to the web app at [origin], with the headers that let it read. */
+function send(
+  response: ServerResponse,
+  status: number,
+  body: unknown,
+  signatures: Signatures,
+  origin: string | null,
+): void {
   const text = JSON.stringify(body);
+  // Every answer depends on the origin of the request, so every answer says so, whether a cache keeps it or not.
   response.writeHead(status, {
     "content-type": "application/json",
     "cache-control": "no-store",
+    vary: "origin",
     ...signatures(status, text),
+    ...(origin === null ? {} : corsHeaders(origin)),
   });
   response.end(text);
+}
+
+/** The headers that let the web app at [origin] read an answer, with the signatures of the answer among them. */
+function corsHeaders(origin: string): Record<string, string> {
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-expose-headers": ANSWER_HEADERS_EXPOSED,
+  };
+}
+
+/** Answers the question of a browser about a request of the web app at [origin]: what it may send. */
+function preflight(response: ServerResponse, origin: string): void {
+  response.writeHead(204, {
+    "access-control-allow-origin": origin,
+    "access-control-allow-methods": METHODS_ALLOWED,
+    "access-control-allow-headers": REQUEST_HEADERS_ALLOWED,
+    "access-control-max-age": String(PREFLIGHT_MAX_AGE_S),
+    "cache-control": "no-store",
+    vary: "origin",
+  });
+  response.end();
 }
 
 /**
@@ -143,14 +190,19 @@ function readAmount(value: unknown): string {
 }
 
 /**
- * The relay answers the Kranox app only, which sends JSON and no header of a browser. A browser adds Origin or
- * Sec-Fetch-Site to a request from a page, and a page that posts plain text needs no permission first, so the relay
- * refuses both: no web page can make its visitors create exchanges under the key of the relay.
+ * The origin of the web app of Kranox when the request comes from it, or null for the Mac app, which sends JSON and
+ * no header of a browser. A browser adds Origin or Sec-Fetch-Site to a request from a page, and a page that posts
+ * plain text needs no permission first, so the relay refuses every page but the web app at the origins of its
+ * settings: no other web page can make its visitors create exchanges under the key of the relay.
  */
-function refuseBrowsers(request: IncomingMessage): void {
-  if (request.headers.origin !== undefined || request.headers["sec-fetch-site"] !== undefined) {
-    throw new RequestError(403, "The relay answers the Kranox app only.");
+function pageOrigin(request: IncomingMessage, allowedOrigins: readonly string[]): string | null {
+  const origin = header(request, "origin");
+  if (origin !== undefined) {
+    if (allowedOrigins.includes(origin)) return origin;
+    throw new RequestError(403, PAGE_REFUSED);
   }
+  if (request.headers["sec-fetch-site"] !== undefined) throw new RequestError(403, PAGE_REFUSED);
+  return null;
 }
 
 function requireJson(request: IncomingMessage): void {
@@ -493,7 +545,6 @@ async function route(parts: RelayParts, request: IncomingMessage, raw: Buffer): 
   const { exchanger, scanner } = parts;
   const url = new URL(request.url ?? "/", "http://relay");
   const method = request.method ?? "GET";
-  refuseBrowsers(request);
   if (method === "POST") requireJson(request);
   if (method === "GET" && url.pathname === "/health") return [200, { ok: true }];
   if (method === "GET" && url.pathname === "/ready") return [200, await ready(exchanger)];
@@ -535,38 +586,56 @@ function upstreamAnswer(error: UpstreamError): [number, string] {
   return [502, "ChangeNOW failed."];
 }
 
-/** The relay of the bridge. */
+/** The status and the body that answer a failure of a request. */
+function failure(error: unknown): [number, unknown] {
+  if (error instanceof RequestError) return [error.status, { error: error.message }];
+  if (error instanceof CreationKeyInvalid) return [400, { error: error.message }];
+  if (error instanceof CreationKeyReused) return [422, { error: error.message }];
+  if (error instanceof CreationKeysFull) return [503, { error: error.message }];
+  if (error instanceof GatewayError) return [error.status, { error: error.message, exchangeId: error.exchangeId }];
+  if (error instanceof UpstreamError) {
+    const [status, message] = upstreamAnswer(error);
+    return [status, { error: message }];
+  }
+  return [500, { error: "The relay failed." }];
+}
+
+/** The relay of the bridge. Throws at once for an origin of the web app that is not one as a browser sends it. */
 export function createRelay(parts: RelayParts): Server {
+  const allowedOrigins = parts.allowedOrigins.map((origin) => checkOrigin(origin, "The origins of the web app"));
   return createServer((request, response) => {
     const nonce = readNonce(header(request, NONCE_HEADER));
     let hash: string | null = null;
+    let origin: string | null = null;
     const signed = signatures(parts.signer, request, nonce, () => hash);
-    const answer = (status: number, body: unknown) => send(response, status, body, signed);
+    const answer = (status: number, body: unknown) => send(response, status, body, signed, origin);
+    const fail = (error: unknown) => {
+      const [status, body] = failure(error);
+      answer(status, body);
+    };
+    try {
+      origin = pageOrigin(request, allowedOrigins);
+    } catch (error) {
+      fail(error);
+      return;
+    }
+    // A browser asks about a request of the web app before it sends it. Nobody else asks.
+    if (request.method === "OPTIONS") {
+      if (origin === null) fail(new RequestError(404, "The relay has no such route."));
+      else preflight(response, origin);
+      return;
+    }
+    // A request of the web app carries a nonce, so that every answer to a page is signed. The apps before 0.3.1,
+    // which send no nonce, send no origin either.
+    if (origin !== null && nonce === "") {
+      fail(new RequestError(400, "A request of the web app needs its nonce."));
+      return;
+    }
     readRaw(request)
       .then((raw) => {
         hash = requestHash(raw);
         return route(parts, request, raw);
       })
-      .then(
-        ([status, body]) => answer(status, body),
-        (error: unknown) => {
-          if (error instanceof RequestError) {
-            answer(error.status, { error: error.message });
-          } else if (error instanceof CreationKeyInvalid) {
-            answer(400, { error: error.message });
-          } else if (error instanceof CreationKeyReused) {
-            answer(422, { error: error.message });
-          } else if (error instanceof CreationKeysFull) {
-            answer(503, { error: error.message });
-          } else if (error instanceof GatewayError) {
-            answer(error.status, { error: error.message, exchangeId: error.exchangeId });
-          } else if (error instanceof UpstreamError) {
-            const [status, message] = upstreamAnswer(error);
-            answer(status, { error: message });
-          } else {
-            answer(500, { error: "The relay failed." });
-          }
-        },
-      );
+      .then(([status, body]) => answer(status, body), fail);
   });
 }

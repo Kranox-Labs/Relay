@@ -14,6 +14,11 @@ export interface RelayConfig {
   swapTokenKey: string;
   /** The private key that signs every answer, as PEM text. */
   answerSigningKey: string;
+  /**
+   * The origins of the web app of Kranox, which the relay answers from a browser, such as https://app.kranox.cash.
+   * None by default: the Mac app sends no origin, and a request from any other page is refused.
+   */
+  allowedOrigins: readonly string[];
 }
 
 /** The API of ChangeNOW, whose v2 serves every range, estimate, and exchange of the relay. */
@@ -180,6 +185,48 @@ function readPem(name: string): string {
   return pem;
 }
 
+/**
+ * Reads the origins that the relay answers from a browser, from the variable [name]: origins such as
+ * https://app.kranox.cash, separated by commas, or nothing for none. An origin holds no path and no slash at its end.
+ */
+/** The hosts that may be allowed over plain HTTP: the web app on the machine of a developer. */
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * [origin] as a browser sends it in the header Origin: lowercase, HTTPS unless on the machine of a developer, with
+ * no path, no default port, and no slash at the end, such as https://app.kranox.cash. Throws for anything else, and
+ * names the value, which is no secret. [name] says where the value comes from.
+ */
+export function checkOrigin(origin: string, name: string): string {
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    throw new Error(`${name} holds "${origin}", which is no origin such as https://app.kranox.cash.`);
+  }
+  if (url.origin !== origin || origin === "null") {
+    throw new Error(
+      `${name} holds "${origin}", which is not an origin as a browser sends it: lowercase, without a path, a default port, or a slash at the end, such as https://app.kranox.cash.`,
+    );
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && LOCAL_HOSTS.has(url.hostname))) {
+    throw new Error(`${name} holds "${origin}", which is not HTTPS; plain HTTP serves localhost and 127.0.0.1 only.`);
+  }
+  return origin;
+}
+
+/**
+ * The origins that the relay answers from a browser, from [value]: origins separated by commas, or nothing for none.
+ * Each must pass [checkOrigin], and none may come twice.
+ */
+export function parseOrigins(value: string | undefined, name: string): string[] {
+  const text = value?.trim();
+  if (!text) return [];
+  const origins = text.split(",").map((item) => checkOrigin(item.trim(), name));
+  if (new Set(origins).size !== origins.length) throw new Error(`${name} lists an origin twice.`);
+  return origins;
+}
+
 export function loadConfig(): RelayConfig {
   checkCreationKeys(UPSTREAM_CALLS_PER_SECOND, CREATION_KEY_MS, CREATION_KEY_ENTRIES);
   const port = Number(required("RELAY_PORT"));
@@ -202,5 +249,6 @@ export function loadConfig(): RelayConfig {
     alchemyApiKey,
     swapTokenKey,
     answerSigningKey,
+    allowedOrigins: parseOrigins(process.env.ALLOWED_ORIGINS, "ALLOWED_ORIGINS"),
   };
 }

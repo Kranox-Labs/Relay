@@ -25,6 +25,7 @@ const relay = createRelay({
   tokens: new SwapTokens(config.swapTokenKey),
   creations: new CreationKeys(CREATION_KEY_MS, CREATION_KEY_ENTRIES),
   signer: new AnswerSigner(config.answerSigningKey),
+  allowedOrigins: config.allowedOrigins,
 });
 relay.listen(config.port, config.host, () => {
   // The only line that the relay writes: where it answers. It never writes a request.
