@@ -11,7 +11,7 @@ import {
   SCAN_RECENT_TRANSFERS,
   UPSTREAM_TIMEOUT_MS,
 } from "./config.mts";
-import { GatewayError } from "./changenow.mts";
+import { GatewayError } from "./exchanger.mts";
 import { objectOrNull, stringOrNull, type Json } from "./json.mts";
 import { CallLimiter } from "./limiter.mts";
 import { readNames } from "./names.mts";

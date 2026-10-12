@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Blockscout } from "../src/blockscout.mts";
-import { GatewayError, type Exchanger } from "../src/changenow.mts";
+import { GatewayError, type Exchanger } from "../src/exchanger.mts";
 import { BLOCKSCOUT_CALLS_PER_SECOND, METADATA_URL, SCAN_CACHE_MS } from "../src/config.mts";
 import type { ChainScan, ChainScanner } from "../src/scan.mts";
 import { createRelay } from "../src/server.mts";
@@ -477,6 +477,7 @@ test("waits for its budget of calls instead of passing it", async () => {
 async function relayWith(scanner: ChainScanner | null): Promise<{ base: string; close: () => void }> {
   const relay = createRelay({
     exchanger: {} as Exchanger,
+    simpleswap: null,
     scanner,
     tokens: new SwapTokens("a secret of the test"),
     creations: new CreationKeys(60_000, 10),

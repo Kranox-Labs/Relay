@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { GatewayError } from "../src/changenow.mts";
+import { GatewayError } from "../src/exchanger.mts";
 import { SCAN_SOURCE_PAUSE_MS } from "../src/config.mts";
 import { FallbackScanner, type ChainScan, type ChainScanner } from "../src/scan.mts";
 

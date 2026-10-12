@@ -6,6 +6,8 @@ export interface RelayConfig {
   host: string;
   port: number;
   changenowApiKey: string;
+  /** The key of SimpleSwap, the second exchanger of pay, or null when the relay has none: the app then has ChangeNOW alone. */
+  simpleswapApiKey: string | null;
   /** The key of the PRO API of Blockscout for the scan of an address, or null when the relay has none. */
   blockscoutApiKey: string | null;
   /** The key of Alchemy for the scan of an address, or null when the relay has none. The relay prefers it. */
@@ -23,6 +25,29 @@ export interface RelayConfig {
 
 /** The API of ChangeNOW, whose v2 serves every range, estimate, and exchange of the relay. */
 export const CHANGENOW_BASE_URL = "https://api.changenow.io";
+
+/** The API of SimpleSwap, whose v3 serves the ranges, the estimates, and the exchanges of pay through it. */
+export const SIMPLESWAP_BASE_URL = "https://api.simpleswap.io";
+
+/**
+ * The key of SimpleSwap allows 50 calls in a window of about a minute (CHECKED 12 Oct 2026: the headers
+ * x-ratelimit-limit 50 and x-ratelimit-reset, a time about a minute ahead). The bucket of the relay starts full and
+ * refills over a minute, so one window of SimpleSwap can see a burst and a refill together: half of the budget here
+ * keeps the two under 50 (R-02 of the scan of 12 Oct 2026), and the relay answers 503 above it.
+ */
+export const SIMPLESWAP_CALLS_PER_MINUTE = 25;
+
+/** The relay keeps a range of SimpleSwap for this long, so that the pages of the app spend one call on it. */
+export const SIMPLESWAP_RANGE_CACHE_MS = 60_000;
+
+/**
+ * The relay keeps a quote of SimpleSwap for this long, for the same coin, rate, and amount, so that the pages of the
+ * app, which ask the same quote again as they load, spend one call on it; a fixed rate holds for about two minutes.
+ */
+export const SIMPLESWAP_ESTIMATE_CACHE_MS = 10_000;
+
+/** The relay keeps at most this many quotes of SimpleSwap at once, and forgets them all when the list is full. */
+export const SIMPLESWAP_ESTIMATE_CACHE_ENTRIES = 200;
 
 /** A call to ChangeNOW that takes longer than this fails, so that the app does not wait without end. */
 export const UPSTREAM_TIMEOUT_MS = 20_000;
@@ -234,6 +259,14 @@ export function loadConfig(): RelayConfig {
     throw new Error(`RELAY_PORT must be a whole number from 1 to ${HIGHEST_PORT}.`);
   }
   const changenowApiKey = readKey("CHANGENOW_API_KEY_FILE", "ChangeNOW");
+  // The second exchanger of pay is optional: without the variable, the app has ChangeNOW alone.
+  const simpleswapApiKey = process.env.SIMPLESWAP_API_KEY_FILE?.trim()
+    ? readKey("SIMPLESWAP_API_KEY_FILE", "SimpleSwap")
+    : null;
+  // The same key for both would go to SimpleSwap in every call (R-06 of the scan of 12 Oct 2026).
+  if (simpleswapApiKey !== null && simpleswapApiKey === changenowApiKey) {
+    throw new Error("SIMPLESWAP_API_KEY_FILE and CHANGENOW_API_KEY_FILE hold the same key.");
+  }
   // The scan of an address is optional: without the variable, its route answers that the relay cannot scan yet.
   const blockscoutApiKey = process.env.BLOCKSCOUT_API_KEY_FILE?.trim()
     ? readKey("BLOCKSCOUT_API_KEY_FILE", "Blockscout")
@@ -245,6 +278,7 @@ export function loadConfig(): RelayConfig {
     host: required("RELAY_HOST"),
     port,
     changenowApiKey,
+    simpleswapApiKey,
     blockscoutApiKey,
     alchemyApiKey,
     swapTokenKey,

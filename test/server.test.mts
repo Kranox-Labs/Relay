@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync, verify } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
-import { UpstreamError, type ChainAsset, type Exchanger, type PayRate } from "../src/changenow.mts";
+import { UpstreamError, type ChainAsset, type Exchanger, type PayExchanger, type PayRate } from "../src/exchanger.mts";
 import { CreationKeys } from "../src/creations.mts";
 import { createRelay } from "../src/server.mts";
 import { AnswerSigner, answerMessage, requestHash } from "../src/signing.mts";
@@ -44,9 +44,21 @@ const STATUS_REFUSALS: Record<string, [number, string]> = {
 };
 
 const fake: Exchanger = {
+  name: "ChangeNOW",
+  payNames(asset: ChainAsset, rate: PayRate) {
+    return {
+      from: { currency: "xmr", network: "xmr" },
+      to: { currency: asset, network: "hood" },
+      flow: rate === "fixed" ? "fixed-rate" : "standard",
+    };
+  },
+  receiveNames(asset: ChainAsset) {
+    return { from: { currency: asset, network: "hood" }, to: { currency: "xmr", network: "xmr" }, flow: "standard" };
+  },
   async minAmount(asset: ChainAsset) {
     calls.push(["min", asset]);
-    if (minAmountFails) throw new UpstreamError(401, "Invalid api key: the account of Kranox is suspended");
+    if (minAmountFails)
+      throw new UpstreamError(401, "Invalid api key: the account of Kranox is suspended", "ChangeNOW");
     return 0.004;
   },
   async estimate(asset: ChainAsset, amount: string) {
@@ -55,7 +67,7 @@ const fake: Exchanger = {
   },
   async create(asset: ChainAsset, amount: string, address: string, refundAddress: string | null) {
     calls.push(["create", asset, amount, address, refundAddress]);
-    if (amount === "0.001") throw new UpstreamError(400, "Amount is less than minimal");
+    if (amount === "0.001") throw new UpstreamError(400, "Amount is less than minimal", "ChangeNOW");
     // Seven amounts stand for faults of ChangeNOW: another payout address, a deposit address that is not on Robinhood
     // Chain, another amount, another pair of coins, another refund address, a refund address left out, and one that
     // the request never named. A last one records the refund address in lowercase, as ChangeNOW may.
@@ -129,7 +141,7 @@ const fake: Exchanger = {
     calls.push(["status", id]);
     // Some ids stand for error answers of ChangeNOW.
     const refusal = STATUS_REFUSALS[id];
-    if (refusal !== undefined) throw new UpstreamError(refusal[0], refusal[1]);
+    if (refusal !== undefined) throw new UpstreamError(refusal[0], refusal[1], "ChangeNOW");
     return {
       status: "exchanging",
       amountTo: null,
@@ -145,10 +157,75 @@ const fake: Exchanger = {
   },
 };
 
+// The second exchanger of pay in the test: SimpleSwap, with its own names and no fees. A deposit address of XMR as above.
+const simpleCalls: unknown[][] = [];
+const fakeSimple: PayExchanger = {
+  name: "SimpleSwap",
+  payNames(asset: ChainAsset, rate: PayRate) {
+    return { from: { currency: "xmr", network: "xmr" }, to: { currency: asset, network: "robinhood" }, flow: rate };
+  },
+  async payRange(asset: ChainAsset, rate: PayRate) {
+    simpleCalls.push(["payRange", asset, rate]);
+    return rate === "fixed" ? { minXmr: 0.0246892632, maxXmr: 1.495230709567 } : { minXmr: 0.0143601108, maxXmr: null };
+  },
+  async payEstimate(asset: ChainAsset, rate: PayRate, xmrAmount: string) {
+    simpleCalls.push(["payEstimate", asset, rate, xmrAmount]);
+    return {
+      amount: 47.953709,
+      rateId: rate === "fixed" ? "xmp4w9f3x2cy0tug8ju_rs97tvfcp15d" : null,
+      validUntil: rate === "fixed" ? "2026-10-12T11:51:43.473Z" : null,
+      warning: null,
+      depositFee: null,
+      withdrawalFee: null,
+      speedMinutes: null,
+    };
+  },
+  async createPay(
+    asset: ChainAsset,
+    rate: PayRate,
+    xmrAmount: string,
+    address: string,
+    refundAddress: string,
+    rateId: string | null,
+  ) {
+    simpleCalls.push(["createPay", asset, rate, xmrAmount, address, refundAddress, rateId]);
+    // One amount stands for an id of a form the relay cannot read back.
+    return {
+      id: xmrAmount === "0.44" ? "bad id!" : "pch7l7kd1v2mzh1",
+      fromAmount: Number(xmrAmount),
+      toAmount: 47.953709,
+      payinAddress: XMR_DEPOSIT,
+      payoutAddress: address,
+      refundAddress,
+      fromCurrency: "xmr",
+      fromNetwork: "xmr",
+      toCurrency: asset,
+      toNetwork: "robinhood",
+      flow: rate,
+    };
+  },
+  async status(id: string) {
+    simpleCalls.push(["status", id]);
+    return {
+      status: "waiting",
+      amountTo: null,
+      expectedAmountTo: 47.953709,
+      payinHash: null,
+      payoutHash: null,
+      refundAddress: null,
+      refundHash: null,
+      refundAmount: null,
+      updatedAt: "2026-10-12T11:50:00.000Z",
+      validUntil: "2026-10-12T12:20:00.000Z",
+    };
+  },
+};
+
 const tokens = new SwapTokens("a secret of the test");
 const signingKeys = generateKeyPairSync("ec", { namedCurve: "P-256" });
 const relay = createRelay({
   exchanger: fake,
+  simpleswap: fakeSimple,
   scanner: null,
   tokens,
   creations: new CreationKeys(60_000, 100),
@@ -224,7 +301,7 @@ test("makes a swap to a Monero mainnet address, with an optional refund address"
   assert.equal(body.depositAddress, CHAIN_DEPOSIT);
   assert.equal(body.payoutAddress, MAINNET_SUBADDRESS);
   assert.equal(body.refundAddress, REFUND_ADDRESS, "the app compares it with the one that it sent");
-  assert.equal(body.readToken, tokens.issue("3a2360771439a3"));
+  assert.equal(body.readToken, tokens.issue("3a2360771439a3", "changenow"));
   assert.deepEqual(calls, [["create", "eth", "0.0055", MAINNET_SUBADDRESS, REFUND_ADDRESS]]);
   const [, withoutRefund] = await json(
     "/v1/receive/swaps",
@@ -341,6 +418,7 @@ test("answers a refused page without the headers of the web app, and needs a non
 test("refuses an origin of the web app that no browser sends, before it listens", () => {
   const parts = {
     exchanger: fake,
+    simpleswap: null,
     scanner: null,
     tokens,
     creations: new CreationKeys(60_000, 100),
@@ -446,6 +524,7 @@ test("reads the state of a swap, without its addresses", async () => {
     "expectedOut",
     "id",
     "payoutHash",
+    "provider",
     "refundAmount",
     "refundHash",
     "status",
@@ -466,9 +545,21 @@ test("reads the state of a swap, without its addresses", async () => {
 test("gives the range of one payment at each rate, in XMR", async () => {
   const [status, body] = await json("/v1/pay/range?asset=eth&rate=fixed");
   assert.equal(status, 200);
-  assert.deepEqual(body, { asset: "eth", rate: "fixed", minXmr: 0.02267982, maxXmr: 1.451521737121 });
+  assert.deepEqual(body, {
+    provider: "changenow",
+    asset: "eth",
+    rate: "fixed",
+    minXmr: 0.02267982,
+    maxXmr: 1.451521737121,
+  });
   const [, floating] = await json("/v1/pay/range?asset=eth&rate=floating");
-  assert.deepEqual(floating, { asset: "eth", rate: "floating", minXmr: 0.0118679, maxXmr: null });
+  assert.deepEqual(floating, {
+    provider: "changenow",
+    asset: "eth",
+    rate: "floating",
+    minXmr: 0.0118679,
+    maxXmr: null,
+  });
   for (const query of ["asset=btc&rate=fixed", "asset=eth", "asset=eth&rate=best"]) {
     const [bad] = await json(`/v1/pay/range?${query}`);
     assert.equal(bad, 400, query);
@@ -479,6 +570,7 @@ test("quotes the coin that an amount of XMR buys at a fixed rate, with the fees 
   const [status, body] = await json("/v1/pay/quote?asset=usdg&rate=fixed&xmrAmount=0.1");
   assert.equal(status, 200);
   assert.deepEqual(body, {
+    provider: "changenow",
     asset: "usdg",
     rate: "fixed",
     xmrAmount: "0.1",
@@ -534,13 +626,14 @@ test("makes a payment to an address on Robinhood Chain, with a refund to this wa
   assert.equal(status, 201);
   assert.deepEqual(body, {
     id: "9f4e2c71b03ad1",
+    provider: "changenow",
     asset: "usdg",
     amount: 51.229932,
     xmrAmount: 0.1,
     depositAddress: XMR_DEPOSIT,
     payoutAddress: RECIPIENT.toLowerCase(),
     refundAddress: MAINNET_SUBADDRESS,
-    readToken: tokens.issue("9f4e2c71b03ad1"),
+    readToken: tokens.issue("9f4e2c71b03ad1", "changenow"),
   });
   assert.deepEqual(calls, [["createPay", "usdg", "fixed", "0.1", RECIPIENT, MAINNET_SUBADDRESS, RATE_ID]]);
 });
@@ -641,10 +734,10 @@ test("answers an unknown route with 404", async () => {
 
 test("reads a swap with its token, refuses the token of another swap, and lets the older apps read without one", async () => {
   const id = "3a2360771439a3";
-  const withToken = await json(`/v1/swaps/${id}`, { headers: { "kranox-swap-token": tokens.issue(id) } });
+  const withToken = await json(`/v1/swaps/${id}`, { headers: { "kranox-swap-token": tokens.issue(id, "changenow") } });
   assert.equal(withToken[0], 200);
   const otherToken = await json(`/v1/swaps/${id}`, {
-    headers: { "kranox-swap-token": tokens.issue("9f4e2c71b03ad1") },
+    headers: { "kranox-swap-token": tokens.issue("9f4e2c71b03ad1", "changenow") },
   });
   assert.deepEqual(otherToken, [403, { error: "The token does not belong to this swap." }]);
   const madeUp = await json(`/v1/swaps/${id}`, { headers: { "kranox-swap-token": "not-a-token" } });
@@ -798,4 +891,159 @@ test("writes the text of a signature of the second form as the app reads it", ()
       '{"id":"9f4e2c71b03ad1"}',
     ].join("\n"),
   );
+});
+
+test("serves pay through SimpleSwap when the app names it, and through ChangeNOW when it names none", async () => {
+  calls.length = 0;
+  simpleCalls.length = 0;
+  const [status, body] = await json("/v1/pay/range?provider=simpleswap&asset=usdg&rate=fixed");
+  assert.equal(status, 200);
+  assert.deepEqual(body, {
+    provider: "simpleswap",
+    asset: "usdg",
+    rate: "fixed",
+    minXmr: 0.0246892632,
+    maxXmr: 1.495230709567,
+  });
+  const [, quote] = await json("/v1/pay/quote?provider=simpleswap&asset=usdg&rate=floating&xmrAmount=0.1");
+  assert.equal(quote.provider, "simpleswap");
+  assert.equal(quote.amount, 47.953709);
+  assert.equal(quote.rateId, null);
+  const [, named] = await json("/v1/pay/range?provider=changenow&asset=eth&rate=fixed");
+  assert.equal(named.provider, "changenow");
+  assert.deepEqual(simpleCalls, [
+    ["payRange", "usdg", "fixed"],
+    ["payEstimate", "usdg", "floating", "0.1"],
+  ]);
+  assert.deepEqual(calls, [["payRange", "eth", "fixed"]]);
+  const [unknown, unknownBody] = await json("/v1/pay/range?provider=kraken&asset=eth&rate=fixed");
+  assert.equal(unknown, 400);
+  assert.match(String(unknownBody.error), /changenow, simpleswap/);
+});
+
+test("makes a payment through SimpleSwap, checks it against its own names, and reads it back from there", async () => {
+  simpleCalls.length = 0;
+  const [status, body] = await json(
+    "/v1/pay/swaps",
+    post({
+      provider: "simpleswap",
+      asset: "usdg",
+      rate: "fixed",
+      xmrAmount: "0.1",
+      address: RECIPIENT,
+      refundAddress: MAINNET_SUBADDRESS,
+      rateId: "xmp4w9f3x2cy0tug8ju_rs97tvfcp15d",
+    }),
+  );
+  assert.equal(status, 201);
+  assert.deepEqual(body, {
+    id: "pch7l7kd1v2mzh1",
+    provider: "simpleswap",
+    asset: "usdg",
+    amount: 47.953709,
+    xmrAmount: 0.1,
+    depositAddress: XMR_DEPOSIT,
+    payoutAddress: RECIPIENT,
+    refundAddress: MAINNET_SUBADDRESS,
+    readToken: tokens.issue("pch7l7kd1v2mzh1", "simpleswap"),
+  });
+  const [read, state] = await json("/v1/swaps/pch7l7kd1v2mzh1?provider=simpleswap", {
+    headers: { "kranox-swap-token": tokens.issue("pch7l7kd1v2mzh1", "simpleswap") },
+  });
+  assert.equal(read, 200);
+  assert.equal(state.provider, "simpleswap");
+  assert.equal(state.status, "waiting");
+  assert.deepEqual(simpleCalls, [
+    ["createPay", "usdg", "fixed", "0.1", RECIPIENT, MAINNET_SUBADDRESS, "xmp4w9f3x2cy0tug8ju_rs97tvfcp15d"],
+    ["status", "pch7l7kd1v2mzh1"],
+  ]);
+});
+
+test("answers that SimpleSwap is not there when the relay has no key for it", async () => {
+  const relayWithout = createRelay({
+    exchanger: fake,
+    simpleswap: null,
+    scanner: null,
+    tokens,
+    creations: new CreationKeys(60_000, 10),
+    signer: new AnswerSigner(signingKeys.privateKey.export({ type: "pkcs8", format: "pem" }).toString()),
+    allowedOrigins: [],
+  });
+  await new Promise<void>((resolve) => relayWithout.listen(0, "127.0.0.1", resolve));
+  const port = (relayWithout.address() as AddressInfo).port;
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/pay/range?provider=simpleswap&asset=eth&rate=fixed`);
+    assert.equal(response.status, 503);
+    assert.match(String(((await response.json()) as Record<string, unknown>).error), /no key for SimpleSwap/);
+    const changenow = await fetch(`http://127.0.0.1:${port}/v1/pay/range?asset=eth&rate=fixed`);
+    assert.equal(changenow.status, 200, "ChangeNOW still answers");
+  } finally {
+    relayWithout.close();
+  }
+});
+
+test("takes the provider of a creation from the body alone, and refuses an empty or null one (R-04)", async () => {
+  const good = {
+    asset: "eth",
+    rate: "floating",
+    xmrAmount: "0.015",
+    address: RECIPIENT,
+    refundAddress: MAINNET_SUBADDRESS,
+  };
+  for (const provider of [null, ""]) {
+    const [status, body] = await json("/v1/pay/swaps", post({ ...good, provider }));
+    assert.equal(status, 400, String(provider));
+    assert.match(String(body.error), /changenow, simpleswap/);
+  }
+  const [inQuery, queryBody] = await json("/v1/pay/swaps?provider=simpleswap", post(good));
+  assert.equal(inQuery, 400);
+  assert.match(String(queryBody.error), /body of the request/);
+  const [emptyRange] = await json("/v1/pay/range?provider=&asset=eth&rate=fixed");
+  assert.equal(emptyRange, 400, "an empty provider in a query is no choice either");
+});
+
+test("binds the read token of a swap to its exchanger (R-03)", async () => {
+  const id = "pch7l7kd1v2mzh1";
+  const simple = tokens.issue(id, "simpleswap");
+  const [right] = await json(`/v1/swaps/${id}?provider=simpleswap`, { headers: { "kranox-swap-token": simple } });
+  assert.equal(right, 200);
+  const [wrongProvider] = await json(`/v1/swaps/${id}?provider=changenow`, {
+    headers: { "kranox-swap-token": simple },
+  });
+  assert.equal(wrongProvider, 403, "the token of a swap at SimpleSwap reads nothing at ChangeNOW");
+  const [otherToken] = await json(`/v1/swaps/${id}?provider=simpleswap`, {
+    headers: { "kranox-swap-token": tokens.issue(id, "changenow") },
+  });
+  assert.equal(otherToken, 403);
+});
+
+test("refuses a created exchange whose id the relay could not read back, and names it (R-08)", async () => {
+  simpleCalls.length = 0;
+  const [status, body] = await json(
+    "/v1/pay/swaps",
+    post({
+      provider: "simpleswap",
+      asset: "eth",
+      rate: "floating",
+      xmrAmount: "0.44",
+      address: RECIPIENT,
+      refundAddress: MAINNET_SUBADDRESS,
+    }),
+  );
+  assert.equal(status, 502);
+  assert.match(String(body.error), /SimpleSwap gave an id of a form/);
+  assert.equal(body.exchangeId, "bad id!");
+  const [read] = await json("/v1/swaps/pch7l7kd1v2mzh1?provider=simpleswap");
+  assert.equal(read, 200, "an id with letters and digits of either exchanger reads");
+  const [underscore] = await json("/v1/swaps/ab_cd-ef12?provider=simpleswap");
+  assert.notEqual(underscore, 400, "an id with _ or - has the right form");
+});
+
+test("checks the key of SimpleSwap too when it is ready (R-11)", async () => {
+  calls.length = 0;
+  simpleCalls.length = 0;
+  const [status] = await json("/ready");
+  assert.equal(status, 200);
+  assert.deepEqual(calls, [["min", "eth"]]);
+  assert.deepEqual(simpleCalls, [["payRange", "eth", "fixed"]]);
 });

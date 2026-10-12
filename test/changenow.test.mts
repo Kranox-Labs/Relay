@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ChangeNow, GatewayError, UpstreamError } from "../src/changenow.mts";
+import { ChangeNow } from "../src/changenow.mts";
+import { GatewayError, UpstreamError } from "../src/exchanger.mts";
 import { MIN_AMOUNT_CACHE_MS, UPSTREAM_CALLS_PER_SECOND } from "../src/config.mts";
 import { CallLimiter } from "../src/limiter.mts";
 

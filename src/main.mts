@@ -8,6 +8,7 @@ import { CreationKeys } from "./creations.mts";
 import { FallbackScanner } from "./scan.mts";
 import { createRelay } from "./server.mts";
 import { AnswerSigner } from "./signing.mts";
+import { SimpleSwap } from "./simpleswap.mts";
 import { SwapTokens } from "./tokens.mts";
 
 const config = loadConfig();
@@ -21,6 +22,7 @@ const sources = [...(alchemy === null ? [] : [alchemy]), ...(blockscout === null
 const scanner = sources.length === 0 ? null : sources.length === 1 ? sources[0] : new FallbackScanner(sources);
 const relay = createRelay({
   exchanger: new ChangeNow(config.changenowApiKey),
+  simpleswap: config.simpleswapApiKey === null ? null : new SimpleSwap(config.simpleswapApiKey),
   scanner,
   tokens: new SwapTokens(config.swapTokenKey),
   creations: new CreationKeys(CREATION_KEY_MS, CREATION_KEY_ENTRIES),

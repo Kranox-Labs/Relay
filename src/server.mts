@@ -7,15 +7,19 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { EVM_ADDRESS_PATTERN, type ChainScanner } from "./scan.mts";
 import {
-  CHAIN_ASSETS,
+  CHAIN_ASSET_NAMES,
   GatewayError,
-  PAY_RATES,
+  PAY_RATE_NAMES,
+  PROVIDER_IDS,
   UpstreamError,
   type ChainAsset,
   type CreatedExchange,
   type Exchanger,
+  type PairNames,
+  type PayExchanger,
   type PayRate,
-} from "./changenow.mts";
+  type ProviderId,
+} from "./exchanger.mts";
 import {
   AMOUNT_MATCH_TOLERANCE,
   MAX_BODY_BYTES,
@@ -43,7 +47,10 @@ import { SWAP_TOKEN_HEADER, type SwapTokens } from "./tokens.mts";
 /** The parts of the relay: the exchanger, the scanner of addresses when the relay has a key for one, the read tokens
  * of swaps, the creations under the keys of the app, the signer of the answers, and the origins of the web app. */
 export interface RelayParts {
+  /** ChangeNOW: the exchanger of receive, and of pay when the app names no other provider. */
   exchanger: Exchanger;
+  /** SimpleSwap, the second exchanger of pay, or null when the relay has no key for it. */
+  simpleswap: PayExchanger | null;
   scanner: ChainScanner | null;
   tokens: SwapTokens;
   creations: CreationKeys;
@@ -64,8 +71,12 @@ const MONERO_ADDRESS_PATTERN = /^[48][1-9A-HJ-NP-Za-km-z]{94}$/;
 /** A deposit address of ChangeNOW for XMR: a standard address or a subaddress of mainnet, or an integrated address. */
 const MONERO_DEPOSIT_PATTERN = /^(?:[48][1-9A-HJ-NP-Za-km-z]{94}|4[1-9A-HJ-NP-Za-km-z]{105})$/;
 
-/** An id of an exchange at ChangeNOW, such as 3a2360771439a3. */
-const EXCHANGE_ID_PATTERN = /^[0-9a-zA-Z]{6,64}$/;
+/**
+ * An id of an exchange, such as 3a2360771439a3 at ChangeNOW or pch7l7kd1v2mzh1 at SimpleSwap, whose rate ids hold "_"
+ * as well. A created exchange with an id of another form is refused before the app gets a token for it (R-08 of the
+ * scan of 12 Oct 2026), so that a swap the app holds can always be read.
+ */
+const EXCHANGE_ID_PATTERN = /^[0-9a-zA-Z_-]{6,64}$/;
 
 /** The id of a fixed rate at ChangeNOW: base64 text, a few hundred characters long. */
 const RATE_ID_PATTERN = /^[A-Za-z0-9+/=_-]{8,1024}$/;
@@ -77,9 +88,6 @@ const JSON_MEDIA_TYPE = "application/json";
 
 /** The answers of ChangeNOW that refuse the request itself; their text tells the user what to change. */
 const REFUSAL_STATUSES = new Set([400, 404, 422]);
-
-/** The coin of Monero in the names of v2, for the checks of a created exchange. */
-const XMR_NAME = "xmr";
 
 /**
  * What a browser asks before a request of the web app, and what it may read of the answer: the headers that the app
@@ -173,13 +181,29 @@ function signatures(
 }
 
 function readAsset(value: unknown): ChainAsset {
-  if (typeof value === "string" && Object.hasOwn(CHAIN_ASSETS, value)) return value as ChainAsset;
-  throw new RequestError(400, `The asset must be one of: ${Object.keys(CHAIN_ASSETS).join(", ")}.`);
+  const asset = CHAIN_ASSET_NAMES.find((name) => name === value);
+  if (asset !== undefined) return asset;
+  throw new RequestError(400, `The asset must be one of: ${CHAIN_ASSET_NAMES.join(", ")}.`);
 }
 
 function readRate(value: unknown): PayRate {
-  if (typeof value === "string" && Object.hasOwn(PAY_RATES, value)) return value as PayRate;
-  throw new RequestError(400, `The rate must be one of: ${Object.keys(PAY_RATES).join(", ")}.`);
+  const rate = PAY_RATE_NAMES.find((name) => name === value);
+  if (rate !== undefined) return rate;
+  throw new RequestError(400, `The rate must be one of: ${PAY_RATE_NAMES.join(", ")}.`);
+}
+
+/**
+ * The exchanger of pay that the app names, or ChangeNOW when the request has no provider at all, as the Mac app sends
+ * it. An empty or null provider is a fault of a client, not a choice, and gets a refusal (R-04 of the scan of 12 Oct
+ * 2026).
+ */
+function readProvider(parts: RelayParts, value: unknown): { id: ProviderId; exchanger: PayExchanger } {
+  if (value === undefined) return { id: "changenow", exchanger: parts.exchanger };
+  const id = PROVIDER_IDS.find((name) => name === value);
+  if (id === undefined) throw new RequestError(400, `The provider must be one of: ${PROVIDER_IDS.join(", ")}.`);
+  if (id === "changenow") return { id, exchanger: parts.exchanger };
+  if (parts.simpleswap === null) throw new RequestError(503, "The relay has no key for SimpleSwap yet.");
+  return { id, exchanger: parts.simpleswap };
 }
 
 function readAmount(value: unknown): string {
@@ -217,25 +241,19 @@ function amountsMatch(sent: string, answered: number): boolean {
   return Math.abs(expected - answered) <= AMOUNT_MATCH_TOLERANCE * Math.max(Math.abs(expected), Math.abs(answered));
 }
 
-/** A name that ChangeNOW left out passes; a name that it gave must be the one of the request. */
+/** A name that the exchanger left out passes; a name that it gave must be the one of the request. */
 function nameMatches(answered: string | null, expected: string): boolean {
-  return answered === null || answered.toLowerCase() === expected;
+  return answered === null || answered.toLowerCase() === expected.toLowerCase();
 }
 
-interface Side {
-  currency: string;
-  network: string;
-}
-
-const XMR_SIDE: Side = { currency: XMR_NAME, network: XMR_NAME };
-
-function pairMatches(created: CreatedExchange, from: Side, to: Side, flow: string): boolean {
+/** Whether a created exchange carries the names of the pair of its request, as the exchanger gives them. */
+function pairMatches(created: CreatedExchange, names: PairNames): boolean {
   return (
-    nameMatches(created.fromCurrency, from.currency) &&
-    nameMatches(created.fromNetwork, from.network) &&
-    nameMatches(created.toCurrency, to.currency) &&
-    nameMatches(created.toNetwork, to.network) &&
-    nameMatches(created.flow, flow)
+    nameMatches(created.fromCurrency, names.from.currency) &&
+    nameMatches(created.fromNetwork, names.from.network) &&
+    nameMatches(created.toCurrency, names.to.currency) &&
+    nameMatches(created.toNetwork, names.to.network) &&
+    nameMatches(created.flow, names.flow)
   );
 }
 
@@ -267,28 +285,30 @@ const sameEvmAddress = (a: string, b: string): boolean => a.toLowerCase() === b.
 
 /** Why an exchange of receive differs from its request, or null when it matches. */
 function receiveMismatch(
+  exchanger: Exchanger,
   created: CreatedExchange,
   asset: ChainAsset,
   amount: string,
   address: string,
   refundAddress: string | null,
 ): string | null {
+  const name = exchanger.name;
   if (!EVM_ADDRESS_PATTERN.test(created.payinAddress)) {
-    return "ChangeNOW gave a deposit address that is not a Robinhood Chain address.";
+    return `${name} gave a deposit address that is not a Robinhood Chain address.`;
   }
-  if (created.payoutAddress !== address) return "ChangeNOW made the exchange for another Monero address.";
+  if (created.payoutAddress !== address) return `${name} made the exchange for another Monero address.`;
   if (!refundMatches(created, refundAddress, sameEvmAddress)) {
-    return "ChangeNOW made the exchange with another refund address.";
+    return `${name} made the exchange with another refund address.`;
   }
-  if (!amountsMatch(amount, created.fromAmount)) return "ChangeNOW made the exchange for another amount.";
-  if (!pairMatches(created, CHAIN_ASSETS[asset], XMR_SIDE, PAY_RATES.floating)) {
-    return "ChangeNOW made the exchange for another pair of coins.";
-  }
+  if (!amountsMatch(amount, created.fromAmount)) return `${name} made the exchange for another amount.`;
+  if (!pairMatches(created, exchanger.receiveNames(asset)))
+    return `${name} made the exchange for another pair of coins.`;
   return null;
 }
 
 /** Why an exchange of pay differs from its request, or null when it matches. */
 function payMismatch(
+  exchanger: PayExchanger,
   created: CreatedExchange,
   asset: ChainAsset,
   rate: PayRate,
@@ -296,25 +316,27 @@ function payMismatch(
   address: string,
   refundAddress: string,
 ): string | null {
+  const name = exchanger.name;
   if (!MONERO_DEPOSIT_PATTERN.test(created.payinAddress)) {
-    return "ChangeNOW gave a deposit address that is not a Monero mainnet address.";
+    return `${name} gave a deposit address that is not a Monero mainnet address.`;
   }
-  if (!sameEvmAddress(created.payoutAddress, address)) {
-    return "ChangeNOW made the exchange for another recipient.";
-  }
-  if (!refundMatches(created, refundAddress, sameText)) {
-    return "ChangeNOW made the exchange with another refund address.";
-  }
-  if (!amountsMatch(xmrAmount, created.fromAmount)) return "ChangeNOW made the exchange for another amount of XMR.";
-  if (!pairMatches(created, XMR_SIDE, CHAIN_ASSETS[asset], PAY_RATES[rate])) {
-    return "ChangeNOW made the exchange for another pair of coins.";
-  }
+  if (!sameEvmAddress(created.payoutAddress, address)) return `${name} made the exchange for another recipient.`;
+  if (!refundMatches(created, refundAddress, sameText)) return `${name} made the exchange with another refund address.`;
+  if (!amountsMatch(xmrAmount, created.fromAmount)) return `${name} made the exchange for another amount of XMR.`;
+  if (!pairMatches(created, exchanger.payNames(asset, rate)))
+    return `${name} made the exchange for another pair of coins.`;
   return null;
 }
 
-/** Refuses an exchange that ChangeNOW made other than the request, with its id, so that support can find it. */
-function checkCreated(created: CreatedExchange, mismatch: string | null): void {
+/**
+ * Refuses an exchange that [exchanger] made other than the request, or with an id of a form the relay cannot read
+ * back, with its id, so that support can find it.
+ */
+function checkCreated(exchanger: PayExchanger, created: CreatedExchange, mismatch: string | null): void {
   if (mismatch !== null) throw new GatewayError(502, mismatch, created.id);
+  if (!EXCHANGE_ID_PATTERN.test(created.id)) {
+    throw new GatewayError(502, `${exchanger.name} gave an id of a form the relay does not take.`, created.id);
+  }
 }
 
 /** One header of the request as text, or undefined when the request has none. */
@@ -384,7 +406,11 @@ async function createSwap(parts: RelayParts, request: IncomingMessage, raw: Buff
     const created = await parts.exchanger.create(asset, amount, address, refundAddress);
     // The app shows the deposit address as a code and the amount as "Send exactly", so the relay passes on only an
     // exchange of the coin and the amount of the request, into the subaddress of the request.
-    checkCreated(created, receiveMismatch(created, asset, amount, address, refundAddress));
+    checkCreated(
+      parts.exchanger,
+      created,
+      receiveMismatch(parts.exchanger, created, asset, amount, address, refundAddress),
+    );
     // The app compares the refund address that ChangeNOW recorded with the one that it sent (wallet O-003 of the second
     // security review).
     return {
@@ -395,19 +421,21 @@ async function createSwap(parts: RelayParts, request: IncomingMessage, raw: Buff
       depositAddress: created.payinAddress,
       payoutAddress: created.payoutAddress,
       refundAddress: recordedRefund(created),
-      readToken: parts.tokens.issue(created.id),
+      readToken: parts.tokens.issue(created.id, "changenow"),
     };
   });
 }
 
-async function payRange(exchanger: Exchanger, url: URL): Promise<unknown> {
+async function payRange(parts: RelayParts, url: URL): Promise<unknown> {
+  const { id: provider, exchanger } = readProvider(parts, url.searchParams.get("provider") ?? undefined);
   const asset = readAsset(url.searchParams.get("asset"));
   const rate = readRate(url.searchParams.get("rate"));
   const range = await exchanger.payRange(asset, rate);
-  return { asset, rate, minXmr: range.minXmr, maxXmr: range.maxXmr };
+  return { provider, asset, rate, minXmr: range.minXmr, maxXmr: range.maxXmr };
 }
 
-async function payQuote(exchanger: Exchanger, url: URL): Promise<unknown> {
+async function payQuote(parts: RelayParts, url: URL): Promise<unknown> {
+  const { id: provider, exchanger } = readProvider(parts, url.searchParams.get("provider") ?? undefined);
   const asset = readAsset(url.searchParams.get("asset"));
   const rate = readRate(url.searchParams.get("rate"));
   const xmrAmount = readAmount(url.searchParams.get("xmrAmount"));
@@ -415,6 +443,7 @@ async function payQuote(exchanger: Exchanger, url: URL): Promise<unknown> {
   // An amount outside the range of the rate gets no estimate; the app shows the range in XMR instead.
   if ("limit" in estimate) {
     return {
+      provider,
       asset,
       rate,
       xmrAmount,
@@ -431,6 +460,7 @@ async function payQuote(exchanger: Exchanger, url: URL): Promise<unknown> {
     };
   }
   return {
+    provider,
     asset,
     rate,
     xmrAmount,
@@ -447,8 +477,13 @@ async function payQuote(exchanger: Exchanger, url: URL): Promise<unknown> {
   };
 }
 
-async function createPay(parts: RelayParts, request: IncomingMessage, raw: Buffer): Promise<unknown> {
+async function createPay(parts: RelayParts, request: IncomingMessage, url: URL, raw: Buffer): Promise<unknown> {
+  // The provider of a creation stands in the body, with the rest of the request, and nowhere else (R-04).
+  if (url.searchParams.has("provider")) {
+    throw new RequestError(400, "The provider of a creation goes in the body of the request, not in its query.");
+  }
   const body = parseBody(raw);
+  const { id: provider, exchanger } = readProvider(parts, body.provider);
   const asset = readAsset(body.asset);
   const rate = readRate(body.rate);
   const xmrAmount = readAmount(body.xmrAmount);
@@ -470,22 +505,23 @@ async function createPay(parts: RelayParts, request: IncomingMessage, raw: Buffe
     throw new RequestError(400, "A floating rate takes no rate id.");
   }
   const refundAddress = body.refundAddress;
-  const fields = { route: "pay", asset, rate, xmrAmount, address, refundAddress, rateId };
+  const fields = { route: "pay", provider, asset, rate, xmrAmount, address, refundAddress, rateId };
   return parts.creations.run(header(request, CREATION_KEY_HEADER), fields, async () => {
-    const created = await parts.exchanger.createPay(asset, rate, xmrAmount, address, refundAddress, rateId);
+    const created = await exchanger.createPay(asset, rate, xmrAmount, address, refundAddress, rateId);
     // The app sends XMR to the deposit address and trusts the recipient, so the relay passes on nothing else.
-    checkCreated(created, payMismatch(created, asset, rate, xmrAmount, address, refundAddress));
+    checkCreated(exchanger, created, payMismatch(exchanger, created, asset, rate, xmrAmount, address, refundAddress));
     // The app compares the refund address that ChangeNOW recorded with the one that it sent (wallet O-003 of the second
     // security review).
     return {
       id: created.id,
+      provider,
       asset,
       amount: created.toAmount,
       xmrAmount: created.fromAmount,
       depositAddress: created.payinAddress,
       payoutAddress: created.payoutAddress,
       refundAddress: recordedRefund(created),
-      readToken: parts.tokens.issue(created.id),
+      readToken: parts.tokens.issue(created.id, provider),
     };
   });
 }
@@ -494,25 +530,29 @@ async function createPay(parts: RelayParts, request: IncomingMessage, raw: Buffe
  * Lets a read of a swap pass when it carries the token of the swap, or, while the older apps run, no token at all; a
  * token of another swap never passes.
  */
-function checkSwapToken(parts: RelayParts, request: IncomingMessage, id: string): void {
+function checkSwapToken(parts: RelayParts, request: IncomingMessage, id: string, provider: ProviderId): void {
   const token = header(request, SWAP_TOKEN_HEADER);
   if (token === undefined) {
     if (SWAP_TOKENS_REQUIRED) throw new RequestError(401, "The read of a swap needs its token.");
     return;
   }
-  if (!parts.tokens.matches(id, token)) throw new RequestError(403, "The token does not belong to this swap.");
+  if (!parts.tokens.matches(id, provider, token)) {
+    throw new RequestError(403, "The token does not belong to this swap.");
+  }
 }
 
-async function readSwap(parts: RelayParts, request: IncomingMessage, id: string): Promise<unknown> {
+async function readSwap(parts: RelayParts, request: IncomingMessage, url: URL, id: string): Promise<unknown> {
+  const { id: provider, exchanger } = readProvider(parts, url.searchParams.get("provider") ?? undefined);
   if (!EXCHANGE_ID_PATTERN.test(id)) throw new RequestError(400, "The swap id has the wrong form.");
-  checkSwapToken(parts, request, id);
-  const status = await parts.exchanger.status(id);
+  checkSwapToken(parts, request, id, provider);
+  const status = await exchanger.status(id);
   // Each step of a swap carries its own facts: the deposit hash, the coin that is expected and then sent with its
   // hash, and, when the swap goes wrong, the refund with its amount and hash. The relay passes on only what the app
   // shows, and no address: the app knows its own refund address. The id lets the app compare the state with the swap
   // that it asked for.
   return {
     id,
+    provider,
     status: status.status,
     expectedOut: status.expectedAmountTo,
     amountOut: status.amountTo,
@@ -525,9 +565,13 @@ async function readSwap(parts: RelayParts, request: IncomingMessage, id: string)
   };
 }
 
-/** Answers whether the relay can use its key: one call to ChangeNOW, which the cache of the minimum keeps rare. */
-async function ready(exchanger: Exchanger): Promise<unknown> {
-  await exchanger.minAmount("eth");
+/**
+ * Answers whether the relay can use its keys: one call to ChangeNOW, which the cache of the minimum keeps rare, and,
+ * with a key for SimpleSwap, one range of it, which its cache keeps rare too (R-11 of the scan of 12 Oct 2026).
+ */
+async function ready(parts: RelayParts): Promise<unknown> {
+  await parts.exchanger.minAmount("eth");
+  if (parts.simpleswap !== null) await parts.simpleswap.payRange("eth", "fixed");
   return { ok: true };
 }
 
@@ -547,15 +591,15 @@ async function route(parts: RelayParts, request: IncomingMessage, raw: Buffer): 
   const method = request.method ?? "GET";
   if (method === "POST") requireJson(request);
   if (method === "GET" && url.pathname === "/health") return [200, { ok: true }];
-  if (method === "GET" && url.pathname === "/ready") return [200, await ready(exchanger)];
+  if (method === "GET" && url.pathname === "/ready") return [200, await ready(parts)];
   if (method === "GET" && url.pathname === "/v1/receive/quote") return [200, await quote(exchanger, url)];
   if (method === "POST" && url.pathname === "/v1/receive/swaps") return [201, await createSwap(parts, request, raw)];
-  if (method === "GET" && url.pathname === "/v1/pay/range") return [200, await payRange(exchanger, url)];
-  if (method === "GET" && url.pathname === "/v1/pay/quote") return [200, await payQuote(exchanger, url)];
-  if (method === "POST" && url.pathname === "/v1/pay/swaps") return [201, await createPay(parts, request, raw)];
+  if (method === "GET" && url.pathname === "/v1/pay/range") return [200, await payRange(parts, url)];
+  if (method === "GET" && url.pathname === "/v1/pay/quote") return [200, await payQuote(parts, url)];
+  if (method === "POST" && url.pathname === "/v1/pay/swaps") return [201, await createPay(parts, request, url, raw)];
   if (method === "GET" && url.pathname === "/v1/scan/robinhood") return [200, await scanAddress(scanner, url)];
   const swap = SWAP_PATH.exec(url.pathname);
-  if (method === "GET" && swap) return [200, await readSwap(parts, request, decodeURIComponent(swap[1]))];
+  if (method === "GET" && swap) return [200, await readSwap(parts, request, url, decodeURIComponent(swap[1]))];
   throw new RequestError(404, "The relay has no such route.");
 }
 
@@ -581,9 +625,9 @@ function forwarded(message: string): string {
  */
 function upstreamAnswer(error: UpstreamError): [number, string] {
   if (REFUSAL_STATUSES.has(error.status)) return [422, forwarded(error.message)];
-  if (error.status === 429) return [503, "ChangeNOW is busy. Try again in a minute."];
-  if (error.status === 401 || error.status === 403) return [502, "The relay cannot use ChangeNOW right now."];
-  return [502, "ChangeNOW failed."];
+  if (error.status === 429) return [503, `${error.service} is busy. Try again in a minute.`];
+  if (error.status === 401 || error.status === 403) return [502, `The relay cannot use ${error.service} right now.`];
+  return [502, `${error.service} failed.`];
 }
 
 /** The status and the body that answer a failure of a request. */

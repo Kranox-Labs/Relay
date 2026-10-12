@@ -1,6 +1,6 @@
 // The scan of an address on Robinhood Chain: what the app gets, whatever source the relay reads, and the parts that
 // every source shares, the cache of scans and the wait for a slot of the budget of calls.
-import { GatewayError } from "./changenow.mts";
+import { GatewayError } from "./exchanger.mts";
 import { SCAN_CACHE_ENTRIES, SCAN_CACHE_MS, SCAN_SLOT_WAIT_MS, SCAN_SOURCE_PAUSE_MS } from "./config.mts";
 import type { CallLimiter } from "./limiter.mts";
 

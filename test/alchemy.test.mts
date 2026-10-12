@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Alchemy } from "../src/alchemy.mts";
-import { GatewayError } from "../src/changenow.mts";
+import { GatewayError } from "../src/exchanger.mts";
 import { ALCHEMY_URL, METADATA_URL, SCAN_CACHE_MS } from "../src/config.mts";
 import { oldestOf, type ChainTransfer, type FundingReader } from "../src/scan.mts";
 

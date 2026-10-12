@@ -1,4 +1,4 @@
-// A token bucket that keeps the calls of the relay to ChangeNOW below the budget of its key, for all users together.
+// A token bucket that keeps the calls of the relay to an exchanger below the budget of its key, for all users together.
 // nginx limits each client; this limit holds when many clients call at once.
 
 export class CallLimiter {
@@ -8,15 +8,18 @@ export class CallLimiter {
   #tokens: number;
   #updatedAt: number;
 
-  /** Allows [callsPerSecond] calls in a second, and a burst of as many when the relay was quiet. */
-  constructor(callsPerSecond: number, now: () => number = Date.now) {
-    if (!Number.isFinite(callsPerSecond) || callsPerSecond <= 0) {
-      throw new Error("The calls per second of the limiter must be a number above zero.");
+  /** Allows [calls] calls in a window of [windowMs] (a second by default), and a burst of as many after a quiet window. */
+  constructor(calls: number, now: () => number = Date.now, windowMs = 1000) {
+    if (!Number.isFinite(calls) || calls < 1) {
+      throw new Error("The calls of the limiter must be a number of one or more.");
     }
-    this.#capacity = callsPerSecond;
-    this.#refillPerMs = callsPerSecond / 1000;
+    if (!Number.isFinite(windowMs) || windowMs <= 0) {
+      throw new Error("The window of the limiter must be a number of milliseconds above zero.");
+    }
+    this.#capacity = calls;
+    this.#refillPerMs = calls / windowMs;
     this.#now = now;
-    this.#tokens = callsPerSecond;
+    this.#tokens = calls;
     this.#updatedAt = now();
   }
 
