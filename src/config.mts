@@ -1,7 +1,7 @@
 // The settings of the relay. This module is the only one that reads the environment; it checks every variable at
 // startup and stops with a clear error when one is missing. The API key is read from a file and is never printed.
 import { readFileSync } from "node:fs";
-import type { FromAsset } from "./exchanger.mts";
+import type { ChainAsset, FromAsset } from "./exchanger.mts";
 
 export interface RelayConfig {
   host: string;
@@ -87,6 +87,9 @@ export const ONECLICK_STATUS_CACHE_ENTRIES = 500;
 /** The relay reads the token list of 1Click at most this often, for the check of /ready. */
 export const ONECLICK_TOKENS_CACHE_MS = 10 * 60_000;
 
+/** The relay keeps a failed check of /ready at 1Click this long, and answers it again without a call meanwhile. */
+export const ONECLICK_READY_FAILURE_MS = 60_000;
+
 /**
  * A swap at 1Click takes its deposit until this long after its quote, then refunds what came late. The deposit comes
  * from the wallet of the user on Starknet, which takes a minute, or on Zcash, whose block comes every 75 seconds, so
@@ -112,6 +115,20 @@ export const ONECLICK_REFERRAL = "kranox";
  * of 0.075 USDG, and ChangeNOW takes ZEC from 0.0234.
  */
 export const ONECLICK_MIN_FROM: Readonly<Partial<Record<FromAsset, number>>> = { strk: 20, zec: 0.005 };
+
+/**
+ * The least of each coin on Robinhood Chain that the relay sends through 1Click on the way out, by the coin that
+ * arrives, so that the withdraw fee of 1Click, the same for any amount, stays below a twentieth of what arrives.
+ * CHECKED 13 Oct 2026 with dry quotes: into ZEC the fee is 0.00032 ZEC and the bridge has a floor of about 1.59 USDG
+ * or 0.00063 ETH ("Amount is too low for bridge"); 2 USDG quoted 0.00136 ZEC and 0.005 ETH 0.0102 ZEC, in 140
+ * seconds. Into STRK the fee is about 0.48 STRK and 0.5 USDG quoted 5.08 STRK, 0.0002 ETH 5.09 STRK, in 29 seconds.
+ * ChangeNOW takes USDG from 28.1 into ZEC and from 1.65 into STRK, and ETH from 0.0107 into ZEC and from 0.00018
+ * into STRK.
+ */
+export const ONECLICK_MIN_OUT: Readonly<Partial<Record<FromAsset, Readonly<Record<ChainAsset, number>>>>> = {
+  zec: { usdg: 10, eth: 0.004 },
+  strk: { usdg: 1, eth: 0.0005 },
+};
 
 /** A call to ChangeNOW that takes longer than this fails, so that the app does not wait without end. */
 export const UPSTREAM_TIMEOUT_MS = 20_000;

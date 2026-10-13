@@ -379,3 +379,98 @@ test("takes XMR and ZEC, and says so for another coin before any call", async ()
   });
   assert.equal(sent.length, 0);
 });
+
+test("serves the way out from the network robinhood at the floating rate, with the refund to Robinhood Chain", async () => {
+  const time = clock();
+  const ZEC_ADDRESS = "t1URu8q83ibd8sgDoW3VnJoPjUusRz97h8J";
+  const { fetchImpl, sent } = fakeFetch((call) => {
+    const path = new URL(call.url).pathname;
+    if (path === "/v3/ranges") return result({ min: "12.5201022", max: null });
+    if (path === "/v3/estimates") {
+      return new URL(call.url).searchParams.get("amount") === "20"
+        ? refusal(422, "Amount does not fall within the range. Min: 28.66650126, max: null")
+        : result({ estimatedAmount: "0.0249" });
+    }
+    return result({
+      id: "o7k2m9x1qzr4w5t",
+      type: "floating",
+      tickerFrom: "eth",
+      networkFrom: "robinhood",
+      tickerTo: "zec",
+      networkTo: "zec",
+      amountFrom: "0.02",
+      expectedAmount: "0.02",
+      amountTo: "0.0409",
+      addressFrom: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",
+      addressTo: ZEC_ADDRESS,
+      userRefundAddress: RECIPIENT,
+      status: "waiting",
+      validUntil: null,
+    });
+  });
+  const simpleswap = new SimpleSwap(KEY, { fetchImpl, now: time.now });
+  assert.deepEqual(simpleswap.destinations, ["xmr", "zec"]);
+  assert.deepEqual(await simpleswap.outRange("usdg", "xmr"), { minFrom: 12.5201022, maxFrom: null });
+  assert.deepEqual(Object.fromEntries(new URL(sent[0].url).searchParams), {
+    tickerFrom: "usdg",
+    networkFrom: "robinhood",
+    tickerTo: "xmr",
+    networkTo: "xmr",
+    fixed: "false",
+  });
+  await simpleswap.outRange("usdg", "xmr");
+  await simpleswap.payRange("xmr", "usdg", "floating");
+  assert.equal(sent.length, 2, "the range out and the range in of the same coins are two ranges, each kept a while");
+  assert.deepEqual(await simpleswap.outEstimate("usdg", "zec", "30"), {
+    amount: 0.0249,
+    rateId: null,
+    validUntil: null,
+    warning: null,
+    depositFee: null,
+    withdrawalFee: null,
+    speedMinutes: null,
+  });
+  assert.equal(new URL(sent[2].url).searchParams.get("amount"), "30");
+  assert.equal(new URL(sent[2].url).searchParams.get("tickerTo"), "zec");
+  assert.deepEqual(await simpleswap.outEstimate("usdg", "zec", "20"), {
+    limit: "below",
+    minFrom: 28.66650126,
+    maxFrom: null,
+  });
+  const created = await simpleswap.createOut("eth", "zec", "0.02", ZEC_ADDRESS, RECIPIENT);
+  assert.deepEqual(JSON.parse(String(sent[4].init.body)), {
+    tickerFrom: "eth",
+    networkFrom: "robinhood",
+    tickerTo: "zec",
+    networkTo: "zec",
+    amount: "0.02",
+    addressTo: ZEC_ADDRESS,
+    fixed: false,
+    userRefundAddress: RECIPIENT,
+  });
+  assert.deepEqual(created, {
+    id: "o7k2m9x1qzr4w5t",
+    fromAmount: 0.02,
+    toAmount: 0.0409,
+    payinAddress: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",
+    payoutAddress: ZEC_ADDRESS,
+    refundAddress: RECIPIENT,
+    fromCurrency: "eth",
+    fromNetwork: "robinhood",
+    toCurrency: "zec",
+    toNetwork: "zec",
+    flow: "floating",
+    validUntil: null,
+  });
+  assert.deepEqual(simpleswap.outNames("eth", "zec"), {
+    from: { currency: "eth", network: "robinhood" },
+    to: { currency: "zec", network: "zec" },
+    flow: "floating",
+  });
+  await assert.rejects(simpleswap.outRange("usdg", "strk"), (error: unknown) => {
+    assert.ok(error instanceof GatewayError);
+    assert.match(error.message, /does not take STRK/);
+    return true;
+  });
+  assert.equal(sent.length, 5);
+});

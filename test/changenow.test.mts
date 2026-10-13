@@ -236,3 +236,98 @@ test("asks v2 for STRK on the network strk, and gives a range in the coin of ori
     maxFrom: null,
   });
 });
+
+test("serves the way out at the standard flow: the range, the estimate, and an exchange into a private chain", async () => {
+  const ZEC_ADDRESS = "t1URu8q83ibd8sgDoW3VnJoPjUusRz97h8J";
+  const RECIPIENT = "0x7a3fC0e1b9D24A6c58E0f3B1d9a7C4e2F6b8D015";
+  const { fetchImpl, sent } = fakeFetch(() => Response.json({ minAmount: 28.099947, maxAmount: null }));
+  const changenow = new ChangeNow(KEY, { fetchImpl });
+  assert.deepEqual(changenow.destinations, ["xmr", "strk", "zec"]);
+  assert.deepEqual(await changenow.outRange("usdg", "zec"), { minFrom: 28.099947, maxFrom: null });
+  const range = new URL(sent[0].url);
+  assert.equal(range.pathname, "/v2/exchange/range");
+  assert.deepEqual(Object.fromEntries(range.searchParams), {
+    fromCurrency: "usdg",
+    fromNetwork: "hood",
+    toCurrency: "zec",
+    toNetwork: "zec",
+    flow: "standard",
+  });
+  const estimating = fakeFetch(() =>
+    Response.json({
+      toAmount: 27.3389,
+      transactionSpeedForecast: "10-60",
+      warningMessage: null,
+      depositFee: 0.00001,
+      withdrawalFee: 0.5,
+    }),
+  );
+  assert.deepEqual(await new ChangeNow(KEY, estimating).outEstimate("eth", "strk", "0.01"), {
+    amount: 27.3389,
+    rateId: null,
+    validUntil: null,
+    warning: null,
+    depositFee: 0.00001,
+    withdrawalFee: 0.5,
+    speedMinutes: "10-60",
+  });
+  const estimate = new URL(estimating.sent[0].url);
+  assert.equal(estimate.pathname, "/v2/exchange/estimated-amount");
+  assert.deepEqual(Object.fromEntries(estimate.searchParams), {
+    fromCurrency: "eth",
+    fromNetwork: "hood",
+    toCurrency: "strk",
+    toNetwork: "strk",
+    flow: "standard",
+    fromAmount: "0.01",
+    type: "direct",
+  });
+  const refusing = fakeFetch(() =>
+    Response.json(
+      { error: "out_of_range", message: "Out of min amount", payload: { range: { minAmount: 28.1, maxAmount: null } } },
+      { status: 400 },
+    ),
+  );
+  assert.deepEqual(await new ChangeNow(KEY, refusing).outEstimate("usdg", "zec", "5"), {
+    limit: "below",
+    minFrom: 28.1,
+    maxFrom: null,
+  });
+  const creating = fakeFetch(() =>
+    Response.json({
+      id: "6c1d9e2f4b7a38",
+      fromAmount: 30,
+      toAmount: 0.0249,
+      payinAddress: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",
+      payoutAddress: ZEC_ADDRESS,
+      refundAddress: RECIPIENT,
+      fromCurrency: "usdg",
+      fromNetwork: "hood",
+      toCurrency: "zec",
+      toNetwork: "zec",
+      flow: "standard",
+    }),
+  );
+  const created = await new ChangeNow(KEY, creating).createOut("usdg", "zec", "30", ZEC_ADDRESS, RECIPIENT);
+  assert.equal(new URL(creating.sent[0].url).pathname, "/v2/exchange");
+  assert.deepEqual(JSON.parse(String(creating.sent[0].init.body)), {
+    fromCurrency: "usdg",
+    fromNetwork: "hood",
+    toCurrency: "zec",
+    toNetwork: "zec",
+    flow: "standard",
+    fromAmount: "30",
+    address: ZEC_ADDRESS,
+    refundAddress: RECIPIENT,
+    type: "direct",
+  });
+  assert.equal(created.id, "6c1d9e2f4b7a38");
+  assert.equal(created.payinAddress, "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984");
+  assert.equal(created.payoutAddress, ZEC_ADDRESS);
+  assert.equal(created.toAmount, 0.0249);
+  assert.deepEqual(changenow.outNames("usdg", "zec"), {
+    from: { currency: "usdg", network: "hood" },
+    to: { currency: "zec", network: "zec" },
+    flow: "standard",
+  });
+});

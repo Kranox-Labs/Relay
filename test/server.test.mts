@@ -32,6 +32,9 @@ const XMR_DEPOSIT = "48PFnHrr8bVGx463yo8SMXGZUp7PyYPgwZJR4MnpgjKCDXpw3XvK6UTbarK
 // A deposit address of ChangeNOW on Robinhood Chain for receive.
 const CHAIN_DEPOSIT = "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984";
 
+// A deposit address of a swap out at 1Click on Robinhood Chain, which names the swap, as 1Click writes it.
+const OUT_DEPOSIT = "0x9c4e1f2a3b5d6c7e8f0a1b2c3d4e5f6a7b8c9d0e";
+
 // A refund address on Starknet of a throwaway wallet, and a deposit address of a swap of STRK, both of the usual length.
 const STRK_REFUND = "0x04a3f9c1b2e7d8a5c6f0e1d2c3b4a5968778695a4b3c2d1e0f1a2b3c4d5e6f70";
 const STRK_DEPOSIT = "0x01d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2";
@@ -77,6 +80,53 @@ const fake: Exchanger = {
   },
   receiveNames(asset: ChainAsset) {
     return { from: { currency: asset, network: "hood" }, to: { currency: "xmr", network: "xmr" }, flow: "standard" };
+  },
+  destinations: ["xmr", "strk", "zec"],
+  outNames(asset: ChainAsset, to: FromAsset) {
+    return { from: { currency: asset, network: "hood" }, to: { currency: to, network: to }, flow: "standard" };
+  },
+  // The ranges of the way out of 13 Oct 2026 at the standard flow: USDG into XMR from 12.27, into ZEC from 28.10,
+  // and into STRK from 1.65; ETH into XMR from 0.0044, into ZEC from 0.0107, and into STRK from 0.00018.
+  async outRange(asset: ChainAsset, to: FromAsset) {
+    calls.push(["outRange", asset, to]);
+    const usdg: Record<FromAsset, number> = { xmr: 12.27461, zec: 28.099947, strk: 1.645272 };
+    const eth: Record<FromAsset, number> = { xmr: 0.0044153, zec: 0.010725, strk: 0.0001845 };
+    return { minFrom: asset === "usdg" ? usdg[to] : eth[to], maxFrom: null };
+  },
+  async outEstimate(asset: ChainAsset, to: FromAsset, fromAmount: string) {
+    calls.push(["outEstimate", asset, to, fromAmount]);
+    if (fromAmount === "1") return { limit: "below" as const, minFrom: 12.27461, maxFrom: null };
+    return {
+      amount: 0.0271,
+      rateId: null,
+      validUntil: null,
+      warning: null,
+      depositFee: 0.7,
+      withdrawalFee: 0.0001,
+      speedMinutes: "10-60",
+    };
+  },
+  async createOut(asset: ChainAsset, to: FromAsset, fromAmount: string, address: string, refundAddress: string) {
+    calls.push(["createOut", asset, to, fromAmount, address, refundAddress]);
+    // Five amounts stand for faults of ChangeNOW: a deposit address that is not on Robinhood Chain, another address
+    // of destination, another refund address, another amount, and another pair of coins. One records the refund
+    // address in lowercase, as ChangeNOW may.
+    const otherPayout = to === "xmr" ? XMR_DEPOSIT : to === "zec" ? ZEC_DEPOSIT : STRK_DEPOSIT;
+    return {
+      id: "6c1d9e2f4b7a38",
+      fromAmount: fromAmount === "88" ? 89 : Number(fromAmount),
+      toAmount: 0.0271,
+      payinAddress: fromAmount === "66" ? XMR_DEPOSIT : CHAIN_DEPOSIT,
+      payoutAddress: fromAmount === "77" ? otherPayout : address,
+      refundAddress:
+        fromAmount === "55" ? REFUND_ADDRESS : fromAmount === "22" ? refundAddress.toLowerCase() : refundAddress,
+      fromCurrency: fromAmount === "99" ? "btc" : asset,
+      fromNetwork: "hood",
+      toCurrency: to,
+      toNetwork: to,
+      flow: "standard",
+      validUntil: null,
+    };
   },
   async minAmount(asset: ChainAsset) {
     calls.push(["min", asset]);
@@ -217,6 +267,44 @@ const fakeSimple: PayExchanger = {
   payNames(from: FromAsset, asset: ChainAsset, rate: PayRate) {
     return { from: { currency: from, network: from }, to: { currency: asset, network: "robinhood" }, flow: rate };
   },
+  destinations: ["xmr", "zec"],
+  outNames(asset: ChainAsset, to: FromAsset) {
+    return { from: { currency: asset, network: "robinhood" }, to: { currency: to, network: to }, flow: "floating" };
+  },
+  // The ranges of the way out of 13 Oct 2026: USDG into XMR from 12.52 and into ZEC from 28.67.
+  async outRange(asset: ChainAsset, to: FromAsset) {
+    simpleCalls.push(["outRange", asset, to]);
+    return { minFrom: to === "zec" ? 28.66650126 : 12.5201022, maxFrom: null };
+  },
+  async outEstimate(asset: ChainAsset, to: FromAsset, fromAmount: string) {
+    simpleCalls.push(["outEstimate", asset, to, fromAmount]);
+    return {
+      amount: 0.0082,
+      rateId: null,
+      validUntil: null,
+      warning: null,
+      depositFee: null,
+      withdrawalFee: null,
+      speedMinutes: null,
+    };
+  },
+  async createOut(asset: ChainAsset, to: FromAsset, fromAmount: string, address: string, refundAddress: string) {
+    simpleCalls.push(["createOut", asset, to, fromAmount, address, refundAddress]);
+    return {
+      id: "o7k2m9x1qzr4w5t",
+      fromAmount: Number(fromAmount),
+      toAmount: 0.0082,
+      payinAddress: CHAIN_DEPOSIT,
+      payoutAddress: address,
+      refundAddress,
+      fromCurrency: asset,
+      fromNetwork: "robinhood",
+      toCurrency: to,
+      toNetwork: to,
+      flow: "floating",
+      validUntil: null,
+    };
+  },
   async payRange(from: FromAsset, asset: ChainAsset, rate: PayRate) {
     simpleCalls.push(["payRange", from, asset, rate]);
     return rate === "fixed"
@@ -293,6 +381,52 @@ const fakeOneClick: PayExchanger = {
       from: from === "zec" ? { currency: ZEC_ASSET, network: "zec" } : { currency: STRK_ASSET, network: "starknet" },
       to: { currency: HOOD_ASSETS[asset], network: "hood" },
       flow: "EXACT_INPUT",
+    };
+  },
+  destinations: ["strk", "zec"],
+  outNames(asset: ChainAsset, to: FromAsset) {
+    return {
+      from: { currency: HOOD_ASSETS[asset], network: "hood" },
+      to: to === "zec" ? { currency: ZEC_ASSET, network: "zec" } : { currency: STRK_ASSET, network: "starknet" },
+      flow: "EXACT_INPUT",
+    };
+  },
+  // The minimums of the relay of 13 Oct 2026: into ZEC 10 USDG or 0.004 ETH, into STRK 1 USDG or 0.0005 ETH.
+  async outRange(asset: ChainAsset, to: FromAsset) {
+    oneCalls.push(["outRange", asset, to]);
+    const minimum = to === "zec" ? (asset === "usdg" ? 10 : 0.004) : asset === "usdg" ? 1 : 0.0005;
+    return { minFrom: minimum, maxFrom: null };
+  },
+  async outEstimate(asset: ChainAsset, to: FromAsset, fromAmount: string) {
+    oneCalls.push(["outEstimate", asset, to, fromAmount]);
+    if (fromAmount === "5" && to === "zec") return { limit: "below" as const, minFrom: 10, maxFrom: null };
+    return {
+      amount: to === "zec" ? 0.01648491 : 222.107025,
+      rateId: null,
+      validUntil: null,
+      warning: null,
+      depositFee: null,
+      withdrawalFee: to === "zec" ? 0.00032 : 0.48,
+      speedMinutes: to === "zec" ? "3" : "1",
+    };
+  },
+  async createOut(asset: ChainAsset, to: FromAsset, fromAmount: string, address: string, refundAddress: string) {
+    oneCalls.push(["createOut", asset, to, fromAmount, address, refundAddress]);
+    // Two amounts stand for faults of 1Click: a deposit address that is not on Robinhood Chain, and another address
+    // of destination. 1Click records the addresses in lowercase.
+    return {
+      id: OUT_DEPOSIT,
+      fromAmount: Number(fromAmount),
+      toAmount: to === "zec" ? 0.01648491 : 222.107025,
+      payinAddress: fromAmount === "66" ? ZEC_DEPOSIT : OUT_DEPOSIT,
+      payoutAddress: fromAmount === "77" ? ZEC_DEPOSIT : address.startsWith("0x") ? address.toLowerCase() : address,
+      refundAddress: refundAddress.toLowerCase(),
+      fromCurrency: HOOD_ASSETS[asset],
+      fromNetwork: null,
+      toCurrency: to === "zec" ? ZEC_ASSET : STRK_ASSET,
+      toNetwork: null,
+      flow: "EXACT_INPUT",
+      validUntil: "2026-10-13T13:30:00.000Z",
     };
   },
   async payRange(from: FromAsset, asset: ChainAsset, rate: PayRate) {
@@ -1603,4 +1737,295 @@ test("serves ZEC through all three exchangers, at transparent addresses alone", 
     ["createPay", "zec", "eth", "floating", "0.005", RECIPIENT, ZEC_REFUND, null],
     ["status", ZEC_DEPOSIT],
   ]);
+});
+
+test("serves the way out: the range and the quote of a coin on Robinhood Chain into XMR, ZEC, or STRK, by provider", async () => {
+  calls.length = 0;
+  simpleCalls.length = 0;
+  oneCalls.length = 0;
+  const [status, body] = await json("/v1/out/range?provider=changenow&from=usdg&to=zec");
+  assert.equal(status, 200);
+  assert.deepEqual(body, { provider: "changenow", from: "usdg", to: "zec", minFrom: 28.099947, maxFrom: null });
+  const [ethRange, ethBody] = await json("/v1/out/range?provider=changenow&from=eth&to=xmr");
+  assert.equal(ethRange, 200);
+  assert.equal(ethBody.minFrom, 0.0044153);
+  assert.equal("minXmr" in ethBody, false, "the names of XMR of the Mac app stay out of the way out");
+  // No client of the way out predates the provider field: a request without one is a fault, not ChangeNOW (R-40).
+  const [noProvider, noProviderBody] = await json("/v1/out/range?from=eth&to=xmr");
+  assert.equal(noProvider, 400);
+  assert.match(String(noProviderBody.error), /The provider must be one of/);
+  const [simpleStrk, simpleStrkBody] = await json("/v1/out/range?provider=simpleswap&from=usdg&to=strk");
+  assert.equal(simpleStrk, 422);
+  assert.equal(simpleStrkBody.error, "SimpleSwap does not pay out STRK.");
+  const [oneXmr, oneXmrBody] = await json("/v1/out/range?provider=oneclick&from=eth&to=xmr");
+  assert.equal(oneXmr, 422);
+  assert.equal(oneXmrBody.error, "NEAR Intents does not pay out XMR.");
+  const [quote, quoteBody] = await json("/v1/out/quote?provider=oneclick&from=usdg&to=zec&fromAmount=20");
+  assert.equal(quote, 200);
+  assert.deepEqual(quoteBody, {
+    provider: "oneclick",
+    from: "usdg",
+    to: "zec",
+    fromAmount: "20",
+    amount: 0.01648491,
+    validUntil: null,
+    warning: null,
+    depositFee: null,
+    withdrawalFee: 0.00032,
+    speedMinutes: "3",
+    limit: null,
+    minFrom: null,
+    maxFrom: null,
+  });
+  const [below, belowBody] = await json("/v1/out/quote?provider=oneclick&from=usdg&to=zec&fromAmount=5");
+  assert.equal(below, 200);
+  assert.equal(belowBody.amount, null);
+  assert.equal(belowBody.limit, "below");
+  assert.equal(belowBody.minFrom, 10);
+  const [belowChangenow, belowChangenowBody] = await json(
+    "/v1/out/quote?provider=changenow&from=usdg&to=xmr&fromAmount=1",
+  );
+  assert.equal(belowChangenow, 200);
+  assert.equal(belowChangenowBody.limit, "below");
+  assert.equal(belowChangenowBody.minFrom, 12.27461);
+  // The coin on Robinhood Chain holds only so many decimals (R-21): USDG six, ETH eighteen.
+  const [tooFine, tooFineBody] = await json("/v1/out/quote?provider=changenow&from=usdg&to=xmr&fromAmount=1.1234567");
+  assert.equal(tooFine, 400);
+  assert.equal(tooFineBody.error, "An amount of USDG has at most 6 decimals.");
+  const [fineEth] = await json("/v1/out/quote?provider=changenow&from=eth&to=xmr&fromAmount=0.123456789012345678");
+  assert.equal(fineEth, 200);
+  const [badFrom, badFromBody] = await json("/v1/out/quote?provider=changenow&from=btc&to=xmr&fromAmount=1");
+  assert.equal(badFrom, 400);
+  assert.match(String(badFromBody.error), /The asset must be one of/);
+  for (const query of ["from=usdg", "from=usdg&to=eth", "from=usdg&to="]) {
+    const [noTo, noToBody] = await json(`/v1/out/range?provider=changenow&${query}`);
+    assert.equal(noTo, 400, query);
+    assert.equal(noToBody.error, "The coin of destination (to) must be one of: xmr, strk, zec.", query);
+  }
+  const [unknownProvider] = await json("/v1/out/range?provider=kraken&from=usdg&to=xmr");
+  assert.equal(unknownProvider, 400);
+  assert.deepEqual(
+    calls.filter((call) => call[0] === "outRange" || call[0] === "outEstimate"),
+    [
+      ["outRange", "usdg", "zec"],
+      ["outRange", "eth", "xmr"],
+      ["outEstimate", "usdg", "xmr", "1"],
+      ["outEstimate", "eth", "xmr", "0.123456789012345678"],
+    ],
+  );
+  assert.deepEqual(simpleCalls, [], "a coin that SimpleSwap does not pay out costs it no call");
+  assert.deepEqual(oneCalls, [
+    ["outEstimate", "usdg", "zec", "20"],
+    ["outEstimate", "usdg", "zec", "5"],
+  ]);
+});
+
+test("makes a swap out through each exchanger, with the refund to the wallet that sends, and reads it back", async () => {
+  calls.length = 0;
+  simpleCalls.length = 0;
+  oneCalls.length = 0;
+  const [status, body] = await json(
+    "/v1/out/swaps",
+    post({
+      provider: "changenow",
+      from: "usdg",
+      to: "xmr",
+      fromAmount: "25",
+      address: MAINNET_SUBADDRESS,
+      refundAddress: RECIPIENT,
+    }),
+  );
+  assert.equal(status, 201);
+  assert.deepEqual(body, {
+    id: "6c1d9e2f4b7a38",
+    provider: "changenow",
+    from: "usdg",
+    to: "xmr",
+    amount: 0.0271,
+    fromAmount: 25,
+    depositAddress: CHAIN_DEPOSIT,
+    payoutAddress: MAINNET_SUBADDRESS,
+    refundAddress: RECIPIENT,
+    validUntil: null,
+    readToken: tokens.issue("6c1d9e2f4b7a38", "changenow"),
+  });
+  const [simple, simpleBody] = await json(
+    "/v1/out/swaps",
+    post({
+      provider: "simpleswap",
+      from: "eth",
+      to: "zec",
+      fromAmount: "0.02",
+      address: ZEC_REFUND,
+      refundAddress: RECIPIENT,
+    }),
+  );
+  assert.equal(simple, 201);
+  assert.equal(simpleBody.id, "o7k2m9x1qzr4w5t");
+  assert.equal(simpleBody.depositAddress, CHAIN_DEPOSIT);
+  assert.equal(simpleBody.payoutAddress, ZEC_REFUND);
+  assert.equal(simpleBody.amount, 0.0082);
+  assert.equal(simpleBody.readToken, tokens.issue("o7k2m9x1qzr4w5t", "simpleswap"));
+  const [one, oneBody] = await json(
+    "/v1/out/swaps",
+    post({
+      provider: "oneclick",
+      from: "usdg",
+      to: "strk",
+      fromAmount: "20",
+      address: STRK_REFUND,
+      refundAddress: RECIPIENT,
+    }),
+  );
+  assert.equal(one, 201);
+  assert.equal(oneBody.id, OUT_DEPOSIT, "the deposit address on Robinhood Chain names the swap at 1Click");
+  assert.equal(oneBody.depositAddress, OUT_DEPOSIT);
+  assert.equal(oneBody.payoutAddress, STRK_REFUND.toLowerCase());
+  assert.equal(oneBody.refundAddress, RECIPIENT.toLowerCase(), "the refund address as 1Click recorded it");
+  assert.equal(oneBody.validUntil, "2026-10-13T13:30:00.000Z");
+  assert.equal(oneBody.readToken, tokens.issue(OUT_DEPOSIT, "oneclick"));
+  const [read, readBody] = await json(`/v1/swaps/${OUT_DEPOSIT}?provider=oneclick`, {
+    headers: { "kranox-swap-token": tokens.issue(OUT_DEPOSIT, "oneclick") },
+  });
+  assert.equal(read, 200);
+  assert.equal(readBody.id, OUT_DEPOSIT);
+  assert.deepEqual(calls, [["createOut", "usdg", "xmr", "25", MAINNET_SUBADDRESS, RECIPIENT]]);
+  assert.deepEqual(simpleCalls, [["createOut", "eth", "zec", "0.02", ZEC_REFUND, RECIPIENT]]);
+  assert.deepEqual(oneCalls, [
+    ["createOut", "usdg", "strk", "20", STRK_REFUND, RECIPIENT],
+    ["status", OUT_DEPOSIT],
+  ]);
+});
+
+test("refuses a swap out with a bad address, refund address, amount, rate, or provider, before any call", async () => {
+  calls.length = 0;
+  const swap = {
+    provider: "changenow",
+    from: "usdg",
+    to: "xmr",
+    fromAmount: "25",
+    address: MAINNET_SUBADDRESS,
+    refundAddress: RECIPIENT,
+  };
+  const refused = async (body: Record<string, unknown>, status: number, error: RegExp, path = "/v1/out/swaps") => {
+    const [got, gotBody] = await json(path, post(body));
+    assert.equal(got, status, JSON.stringify(body));
+    assert.match(String(gotBody.error), error, JSON.stringify(body));
+  };
+  // The address must be one of the chain of the coin that arrives.
+  await refused({ ...swap, address: ZEC_REFUND }, 400, /Monero mainnet address/);
+  await refused({ ...swap, address: RECIPIENT }, 400, /Monero mainnet address/);
+  await refused({ ...swap, to: "zec", address: MAINNET_SUBADDRESS }, 400, /transparent Zcash address/);
+  await refused(
+    { ...swap, to: "zec", address: "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8f3g2d4kv4v9q0jfgcm3vhk3wm6ajqmp8" },
+    400,
+    /transparent Zcash address/,
+  );
+  await refused({ ...swap, to: "strk", address: RECIPIENT }, 400, /Starknet account address/);
+  await refused({ ...swap, address: 42 }, 400, /Monero mainnet address/);
+  // The refund goes to the wallet on Robinhood Chain that sends, so it must be an address of that chain.
+  await refused({ ...swap, refundAddress: MAINNET_SUBADDRESS }, 400, /Robinhood Chain address: 0x and 40 hex digits/);
+  await refused({ ...swap, refundAddress: STRK_REFUND }, 400, /Robinhood Chain address/);
+  await refused({ ...swap, refundAddress: undefined }, 400, /Robinhood Chain address/);
+  await refused({ ...swap, fromAmount: "0" }, 400, /above zero/);
+  await refused({ ...swap, fromAmount: "0.0000001" }, 400, /at most 6 decimals/);
+  await refused({ ...swap, fromAmount: 25 }, 400, /The amount must be a number/);
+  // A swap out has the floating rate alone, and no rate id.
+  await refused({ ...swap, rate: "fixed" }, 400, /floating rate alone/);
+  await refused({ ...swap, rateId: RATE_ID }, 400, /no rate id/);
+  await refused({ ...swap, from: "xmr" }, 400, /The asset must be one of/);
+  await refused({ ...swap, to: "usdg" }, 400, /coin of destination/);
+  await refused({ ...swap, provider: "" }, 400, /The provider must be one of/);
+  await refused({ ...swap, provider: undefined }, 400, /The provider must be one of/);
+  await refused({ ...swap, provider: "simpleswap", to: "strk", address: STRK_REFUND }, 422, /does not pay out STRK/);
+  await refused(swap, 400, /goes in the body/, "/v1/out/swaps?provider=changenow");
+  assert.equal(calls.length, 0, "no refusal reaches an exchanger");
+  // A floating rate named in words passes, as the web app may send it.
+  const [named] = await json("/v1/out/swaps", post({ ...swap, rate: "floating" }));
+  assert.equal(named, 201);
+});
+
+test("passes on no swap out that an exchanger made other than the request, and names its id", async () => {
+  calls.length = 0;
+  oneCalls.length = 0;
+  const swap = {
+    provider: "changenow",
+    from: "usdg",
+    to: "xmr",
+    address: MAINNET_SUBADDRESS,
+    refundAddress: RECIPIENT,
+  };
+  for (const [fromAmount, reason] of [
+    ["66", "not a Robinhood Chain address"],
+    ["77", "another XMR address"],
+    ["55", "another refund address"],
+    ["88", "another amount of USDG"],
+    ["99", "another pair of coins"],
+  ]) {
+    const [status, body] = await json("/v1/out/swaps", post({ ...swap, fromAmount }));
+    assert.equal(status, 502, fromAmount);
+    assert.match(String(body.error), new RegExp(reason), fromAmount);
+    assert.equal(body.exchangeId, "6c1d9e2f4b7a38", fromAmount);
+  }
+  // A refund address recorded in another case of its hex digits is the same wallet.
+  const [lower, lowerBody] = await json("/v1/out/swaps", post({ ...swap, fromAmount: "22" }));
+  assert.equal(lower, 201);
+  assert.equal(lowerBody.refundAddress, RECIPIENT.toLowerCase());
+  // A swap out at 1Click whose deposit address is not on Robinhood Chain, or which pays another address, is refused too.
+  const one = { provider: "oneclick", from: "usdg", to: "strk", address: STRK_REFUND, refundAddress: RECIPIENT };
+  for (const [fromAmount, reason] of [
+    ["66", "not a Robinhood Chain address"],
+    ["77", "another STRK address"],
+  ]) {
+    const [status, body] = await json("/v1/out/swaps", post({ ...one, fromAmount }));
+    assert.equal(status, 502, fromAmount);
+    assert.match(String(body.error), new RegExp(reason), fromAmount);
+    assert.equal(body.exchangeId, OUT_DEPOSIT, fromAmount);
+  }
+  // A Starknet address of the same account in another form passes the check of the recipient.
+  const [padded] = await json(
+    "/v1/out/swaps",
+    post({ ...one, fromAmount: "20", address: `0x${STRK_REFUND.slice(3)}` }),
+  );
+  assert.equal(padded, 201);
+  assert.equal(calls.filter((call) => call[0] === "createOut").length, 6);
+  assert.equal(oneCalls.filter((call) => call[0] === "createOut").length, 3);
+});
+
+test("tells a swap out apart from a payment in the key of a creation", async () => {
+  calls.length = 0;
+  const keyed = (body: unknown, key: string): RequestInit => ({
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": key },
+    body: JSON.stringify(body),
+  });
+  const key = "outkey0outkey0outkey0outkey0";
+  const out = {
+    provider: "changenow",
+    from: "usdg",
+    to: "xmr",
+    fromAmount: "25",
+    address: MAINNET_SUBADDRESS,
+    refundAddress: RECIPIENT,
+  };
+  const [first, firstBody] = await json("/v1/out/swaps", keyed(out, key));
+  assert.equal(first, 201);
+  const [again, againBody] = await json("/v1/out/swaps", keyed(out, key));
+  assert.equal(again, 201, "the same request under the same key gets the same swap");
+  assert.deepEqual(againBody, firstBody);
+  const [other] = await json("/v1/out/swaps", keyed({ ...out, to: "zec", address: ZEC_REFUND }, key));
+  assert.equal(other, 422, "another coin of destination is another request");
+  const payment = {
+    provider: "changenow",
+    from: "xmr",
+    asset: "usdg",
+    rate: "floating",
+    fromAmount: "25",
+    address: RECIPIENT,
+    refundAddress: MAINNET_SUBADDRESS,
+  };
+  const [pay] = await json("/v1/pay/swaps", keyed(payment, key));
+  assert.equal(pay, 422, "a payment under the key of a swap out is another request");
+  assert.equal(calls.filter((call) => call[0] === "createOut").length, 1);
+  assert.equal(calls.filter((call) => call[0] === "createPay").length, 0);
 });

@@ -1,8 +1,9 @@
 // What the relay needs from an exchanger, in one shape for all of them: ChangeNOW serves receive and pay, from 12 Oct
 // 2026 SimpleSwap serves pay as a second provider of the web app, and from 13 Oct 2026 the 1Click API of NEAR Intents
 // serves pay from Starknet and Zcash. Pay takes a coin of a chain of origin, XMR, STRK, or ZEC, into a coin on
-// Robinhood Chain; the server checks every created exchange against its request with the names that each exchanger
-// gives.
+// Robinhood Chain; out, the way back of the web app from 13 Oct 2026, takes a coin on Robinhood Chain into a coin of
+// one of those chains, at a floating rate alone. The server checks every created exchange against its request with
+// the names that each exchanger gives.
 import type { Json } from "./json.mts";
 
 /** The coins on Robinhood Chain that the bridge takes in and pays out, in the names of the relay. */
@@ -10,9 +11,16 @@ export type ChainAsset = "eth" | "usdg";
 
 export const CHAIN_ASSET_NAMES: readonly ChainAsset[] = ["eth", "usdg"];
 
+/** The coins on Robinhood Chain as the app and the user name them. */
+export const CHAIN_ASSET_LABELS: Record<ChainAsset, string> = { eth: "ETH", usdg: "USDG" };
+
+/** The decimals of each coin on Robinhood Chain: ETH has 18 as on Ethereum, and USDG 6 (its contract on the chain). */
+export const CHAIN_ASSET_DECIMALS: Record<ChainAsset, number> = { eth: 18, usdg: 6 };
+
 /**
- * The coins that pay takes in, in the names of the relay: XMR on Monero, and from 13 Oct 2026 STRK on Starknet and
- * ZEC on Zcash (at transparent addresses).
+ * The coins of the private chains, in the names of the relay: XMR on Monero, and from 13 Oct 2026 STRK on Starknet
+ * and ZEC on Zcash (at transparent addresses). Pay takes them in, as the coin of origin; out pays them out, as the
+ * coin of destination.
  */
 export type FromAsset = "xmr" | "strk" | "zec";
 
@@ -151,6 +159,25 @@ export interface PayExchanger {
   ): Promise<CreatedExchange>;
   /** The names of the pair of a payment of [from] into [asset] at [rate], as the exchanger gives them in a created exchange. */
   payNames(from: FromAsset, asset: ChainAsset, rate: PayRate): PairNames;
+  /** The coins of the private chains that the exchanger pays out, for the way out. The server refuses the others before any call. */
+  readonly destinations: readonly FromAsset[];
+  /** The range of the amount of [asset] on Robinhood Chain of one swap out into [to], at the floating rate. */
+  outRange(asset: ChainAsset, to: FromAsset): Promise<PayRange>;
+  /** The amount of [to] that [fromAmount] of [asset] on Robinhood Chain buys, at the floating rate. */
+  outEstimate(asset: ChainAsset, to: FromAsset, fromAmount: string): Promise<PayEstimate | PayOutOfRange>;
+  /**
+   * An exchange of [fromAmount] of [asset] on Robinhood Chain into [to] for [address], an address of the chain of
+   * [to], at the floating rate, with a refund to [refundAddress] on Robinhood Chain.
+   */
+  createOut(
+    asset: ChainAsset,
+    to: FromAsset,
+    fromAmount: string,
+    address: string,
+    refundAddress: string,
+  ): Promise<CreatedExchange>;
+  /** The names of the pair of a swap out of [asset] into [to], as the exchanger gives them in a created exchange. */
+  outNames(asset: ChainAsset, to: FromAsset): PairNames;
   status(id: string): Promise<ExchangeStatus>;
   /**
    * One cheap call that shows that the exchanger answers the relay, for the route /ready, when the exchanger has one;

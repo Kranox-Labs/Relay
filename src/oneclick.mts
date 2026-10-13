@@ -13,6 +13,9 @@
 // when the address stops taking anything (CHECKED 13 Oct 2026: a request with a deadline 20 minutes ahead answered a
 // quote with a deadline 3 days and 20 minutes ahead). A deposit below the amount of the quote is held and refunded at
 // the deadline (its documentation of EXACT_INPUT); NOT CHECKED: what 1Click does with a second deposit on top of it.
+// The way out, from 13 Oct 2026, is the same quote the other way round: USDG or ETH on Robinhood Chain into ZEC or
+// STRK, with the deposit address on Robinhood Chain, which the connected wallet can send to, and the refund to that
+// wallet (CHECKED 13 Oct 2026 with dry quotes; the floors and the fees stand at ONECLICK_MIN_OUT).
 import {
   ONECLICK_BASE_URL,
   ONECLICK_CREATIONS_PER_SECOND,
@@ -21,8 +24,10 @@ import {
   ONECLICK_ESTIMATE_CACHE_ENTRIES,
   ONECLICK_ESTIMATE_CACHE_MS,
   ONECLICK_MIN_FROM,
+  ONECLICK_MIN_OUT,
   ONECLICK_QUOTE_WAIT_MS,
   ONECLICK_READS_PER_SECOND,
+  ONECLICK_READY_FAILURE_MS,
   ONECLICK_REFERRAL,
   ONECLICK_SLIPPAGE_BPS,
   ONECLICK_STATUS_CACHE_ENTRIES,
@@ -31,6 +36,7 @@ import {
   UPSTREAM_TIMEOUT_MS,
 } from "./config.mts";
 import {
+  CHAIN_ASSET_NAMES,
   GatewayError,
   UpstreamError,
   type ChainAsset,
@@ -46,6 +52,7 @@ import {
 } from "./exchanger.mts";
 import { numberOrNull, objectOrNull, stringOrNull, type Json } from "./json.mts";
 import { CallLimiter } from "./limiter.mts";
+import { sameStarknetAddress } from "./starknet.mts";
 
 export const ONECLICK_NAME = "NEAR Intents";
 
@@ -91,18 +98,30 @@ const RECIPIENT_TYPE = "DESTINATION_CHAIN";
 
 /**
  * The addresses of a dry quote, which makes nothing and pays nobody: an address of the right shape of each chain that
- * belongs to nobody, the refund one by coin of origin, since 1Click checks it against the chain (CHECKED 13 Oct 2026:
- * a Starknet address as refundTo of a quote of ZEC answers 400 "refundTo is not valid"). The one of Starknet is made
- * up, digit by digit; the one of Zcash is the public key hash RIPEMD-160(SHA-256("kranox zec dry quote, nobody holds
- * this")) with the prefix t1 and its checksum, so nobody holds its key (R-35 of the scan of 13 Oct 2026). The pages
- * ask for an estimate before the user names a wallet or a refund address. A real swap with either of them is refused
- * (R-22 of the scan of 13 Oct 2026), and the tests pin both as addresses of their chains (R-30).
+ * belongs to nobody, the one of Robinhood Chain for every quote and one by private chain, since 1Click checks each
+ * against its chain (CHECKED 13 Oct 2026: a Starknet address as refundTo of a quote of ZEC answers 400 "refundTo is
+ * not valid"). On the way in the first is the recipient and the second the refund address; on the way out the second
+ * is the recipient and the first the refund address. The one of Starknet is made up, digit by digit; the one of Zcash
+ * is the public key hash RIPEMD-160(SHA-256("kranox zec dry quote, nobody holds this")) with the prefix t1 and its
+ * checksum, so nobody holds its key (R-35 of the scan of 13 Oct 2026). The pages ask for an estimate before the user
+ * names a wallet or an address. A real swap with either of them is refused (R-22 of the scan of 13 Oct 2026), and
+ * the tests pin both as addresses of their chains (R-30).
  */
 const DRY_RECIPIENT = "0x1111111111111111111111111111111111111111";
 const DRY_REFUNDS: Partial<Record<FromAsset, string>> = {
   strk: "0x02b7c9e1f3a5d7b9c1e3f5a7b9d1e3f5a7b9c1d3e5f7a9b1c3d5e7f9b1d3e5f7",
   zec: "t1YXzfrDh5Nq3yVrGGz69mhUX9z8nuuoS1L",
 };
+
+/**
+ * Whether [address] is the address [dry] of a dry quote: a hex address by its value, so that the same account of
+ * Starknet without its leading zero or in another case is caught too (R-39 of the scan of 13 Oct 2026); the other
+ * addresses have one form.
+ */
+function isDryAddress(address: string, dry: string): boolean {
+  if (address === dry) return true;
+  return address.startsWith("0x") && dry.startsWith("0x") && sameStarknetAddress(address, dry);
+}
 
 /**
  * The floor of the bridge of 1Click, in a refusal of an amount, in base units: "Amount is too low for bridge, try at
@@ -237,6 +256,7 @@ export class OneClick implements PayExchanger {
   readonly origins: readonly FromAsset[] = ORIGIN_NAMES;
   // A quote of 1Click moves within its slippage, which the app calls a floating rate; no rate id holds it.
   readonly rates: readonly PayRate[] = ["floating"];
+  readonly destinations: readonly FromAsset[] = ORIGIN_NAMES;
   readonly #apiKey: string | null;
   readonly #fetch: typeof fetch;
   readonly #now: () => number;
@@ -249,6 +269,9 @@ export class OneClick implements PayExchanger {
   readonly #estimates = new Map<string, { value: PayEstimate | PayOutOfRange; at: number }>();
   readonly #states = new Map<string, { value: ExchangeStatus; at: number }>();
   #checkedAt: number | null = null;
+  // The last failed check of /ready, kept for a while, so that a flood of /ready while 1Click is down spends no
+  // call of the budget on the same answer (R-41 of the scan of 13 Oct 2026).
+  #failed: { at: number; error: unknown } | null = null;
 
   constructor(apiKey: string | null, { fetchImpl = fetch, now = Date.now }: OneClickOptions = {}) {
     // An empty key is no key: nothing goes in the header then (R-26).
@@ -258,12 +281,23 @@ export class OneClick implements PayExchanger {
     this.#estimateBudget = new CallLimiter(ONECLICK_ESTIMATES_PER_SECOND, now);
     this.#readBudget = new CallLimiter(ONECLICK_READS_PER_SECOND, now);
     this.#creationBudget = new CallLimiter(ONECLICK_CREATIONS_PER_SECOND, now);
-    this.#readyBudget = new CallLimiter(ORIGIN_NAMES.length + 1, now);
-    // Every coin of origin needs a minimum above zero, seen here rather than at the first quote (R-24).
+    // The check of /ready: the token list, one dry quote of the minimum of each coin of origin, and one of each
+    // minimum of the way out.
+    this.#readyBudget = new CallLimiter(ORIGIN_NAMES.length * (1 + CHAIN_ASSET_NAMES.length) + 1, now);
+    // Every coin of a private chain needs a minimum above zero in, and one out of each coin on Robinhood Chain, seen
+    // here rather than at the first quote (R-24).
     for (const from of ORIGIN_NAMES) {
       const minimum = ONECLICK_MIN_FROM[from];
       if (minimum === undefined || !(minimum > 0)) {
         throw new Error(`The minimum of ${from.toUpperCase()} at ${ONECLICK_NAME} must be a number above zero.`);
+      }
+      for (const asset of CHAIN_ASSET_NAMES) {
+        const outMinimum = ONECLICK_MIN_OUT[from]?.[asset];
+        if (outMinimum === undefined || !(outMinimum > 0)) {
+          throw new Error(
+            `The minimum of ${asset.toUpperCase()} into ${from.toUpperCase()} at ${ONECLICK_NAME} must be a number above zero.`,
+          );
+        }
       }
       if (DRY_REFUNDS[from] === undefined) {
         throw new Error(
@@ -292,10 +326,60 @@ export class OneClick implements PayExchanger {
     const key = `${from}:${asset}:${rate}:${fromAmount}`;
     const kept = this.#estimates.get(key);
     if (kept !== undefined && this.#now() - kept.at < ONECLICK_ESTIMATE_CACHE_MS) return kept.value;
-    const value = await this.#estimate(from, origin, to, fromAmount);
+    const value = await this.#estimate(origin, to, fromAmount, DRY_RECIPIENT, this.#dryRefund(from), minimum);
     if (this.#estimates.size >= ONECLICK_ESTIMATE_CACHE_ENTRIES) this.#estimates.clear();
     this.#estimates.set(key, { value, at: this.#now() });
     return value;
+  }
+
+  async outRange(asset: ChainAsset, to: FromAsset): Promise<PayRange> {
+    this.#outPair(asset, to);
+    return { minFrom: this.#outMinimum(asset, to), maxFrom: null };
+  }
+
+  async outEstimate(asset: ChainAsset, to: FromAsset, fromAmount: string): Promise<PayEstimate | PayOutOfRange> {
+    const [origin, destination] = this.#outPair(asset, to);
+    const minimum = this.#outMinimum(asset, to);
+    // Below the minimum of the relay no quote is asked: 1Click would quote, with a fee that eats the amount.
+    if (Number(fromAmount) < minimum) return { limit: "below", minFrom: minimum, maxFrom: null };
+    const key = `out:${asset}:${to}:${fromAmount}`;
+    const kept = this.#estimates.get(key);
+    if (kept !== undefined && this.#now() - kept.at < ONECLICK_ESTIMATE_CACHE_MS) return kept.value;
+    // The recipient of the dry quote is the address of nobody on the chain of [to], and the refund address the one
+    // of nobody on Robinhood Chain.
+    const value = await this.#estimate(origin, destination, fromAmount, this.#dryRefund(to), DRY_RECIPIENT, minimum);
+    if (this.#estimates.size >= ONECLICK_ESTIMATE_CACHE_ENTRIES) this.#estimates.clear();
+    this.#estimates.set(key, { value, at: this.#now() });
+    return value;
+  }
+
+  async createOut(
+    asset: ChainAsset,
+    to: FromAsset,
+    fromAmount: string,
+    address: string,
+    refundAddress: string,
+  ): Promise<CreatedExchange> {
+    const [origin, destination] = this.#outPair(asset, to);
+    // 1Click refused an address in the checksum case of EIP-55 (CHECKED 13 Oct 2026, a recipient on Robinhood Chain);
+    // the chains read any case of a hex address, and an address of Zcash has one case.
+    const recipient = address.startsWith("0x") ? address.toLowerCase() : address;
+    const refundTo = refundAddress.toLowerCase();
+    // The addresses of a dry quote belong to nobody: a swap for them would pay nobody (R-22).
+    if (isDryAddress(recipient, this.#dryRefund(to)) || isDryAddress(refundTo, DRY_RECIPIENT)) {
+      throw new GatewayError(502, `${ONECLICK_NAME} cannot make a swap for the addresses of a dry quote.`);
+    }
+    const { answer, sent } = await this.#quote(false, origin, destination, fromAmount, recipient, refundTo);
+    return this.#created(answer, sent, fromAmount);
+  }
+
+  outNames(asset: ChainAsset, to: FromAsset): PairNames {
+    const [origin, destination] = this.#outPair(asset, to);
+    return {
+      from: { currency: origin.id, network: origin.blockchain },
+      to: { currency: destination.id, network: destination.blockchain },
+      flow: SWAP_TYPE,
+    };
   }
 
   async createPay(
@@ -312,10 +396,15 @@ export class OneClick implements PayExchanger {
     // 1Click refused a recipient in the checksum case of EIP-55 (CHECKED 13 Oct 2026); the chain reads any case.
     const recipient = address.toLowerCase();
     // The addresses of a dry quote belong to nobody: a swap for them would pay nobody (R-22).
-    if (recipient === DRY_RECIPIENT || refundAddress === this.#dryRefund(from)) {
+    if (isDryAddress(recipient, DRY_RECIPIENT) || isDryAddress(refundAddress, this.#dryRefund(from))) {
       throw new GatewayError(502, `${ONECLICK_NAME} cannot make a swap for the addresses of a dry quote.`);
     }
     const { answer, sent } = await this.#quote(false, origin, to, fromAmount, recipient, refundAddress);
+    return this.#created(answer, sent, fromAmount);
+  }
+
+  /** The swap that a real quote [answer] made for the request [sent], checked against it. */
+  #created(answer: Json, sent: Json, fromAmount: string): CreatedExchange {
     const quote = requireObject(answer, "quote");
     const request = requireObject(answer, "quoteRequest");
     const depositAddress = requireString(quote, "depositAddress");
@@ -379,6 +468,19 @@ export class OneClick implements PayExchanger {
    */
   async ready(): Promise<void> {
     if (this.#checkedAt !== null && this.#now() - this.#checkedAt < ONECLICK_TOKENS_CACHE_MS) return;
+    if (this.#failed !== null && this.#now() - this.#failed.at < ONECLICK_READY_FAILURE_MS) throw this.#failed.error;
+    try {
+      await this.#check();
+    } catch (error) {
+      this.#failed = { at: this.#now(), error };
+      throw error;
+    }
+    this.#failed = null;
+    this.#checkedAt = this.#now();
+  }
+
+  /** The check of /ready itself: the token list, and with a key the dry quotes of the minimums, in and out. */
+  async #check(): Promise<void> {
     const data = await this.#call("/v0/tokens", {}, this.#readyBudget);
     if (!Array.isArray(data)) {
       throw new GatewayError(502, `${ONECLICK_NAME} answered with something other than its tokens.`);
@@ -407,17 +509,45 @@ export class OneClick implements PayExchanger {
       for (const from of ORIGIN_NAMES) {
         const origin = ORIGINS[from];
         if (origin === undefined) continue;
-        const amount = this.#minimum(from).toFixed(origin.decimals);
-        const estimate = await this.#estimate(from, origin, CHAIN_TOKENS.usdg, amount, this.#readyBudget);
+        const minimum = this.#minimum(from);
+        const amount = minimum.toFixed(origin.decimals);
+        const estimate = await this.#estimate(
+          origin,
+          CHAIN_TOKENS.usdg,
+          amount,
+          DRY_RECIPIENT,
+          this.#dryRefund(from),
+          minimum,
+          this.#readyBudget,
+        );
         if ("limit" in estimate) {
           throw new GatewayError(
             502,
             `${ONECLICK_NAME} takes ${origin.symbol} from ${String(estimate.minFrom)}, above the minimum of the relay.`,
           );
         }
+        // The way out: the minimum of each coin on Robinhood Chain into this coin lies above the floor of the bridge.
+        for (const asset of CHAIN_ASSET_NAMES) {
+          const chain = CHAIN_TOKENS[asset];
+          const outMinimum = this.#outMinimum(asset, from);
+          const outEstimate = await this.#estimate(
+            chain,
+            origin,
+            outMinimum.toFixed(chain.decimals),
+            this.#dryRefund(from),
+            DRY_RECIPIENT,
+            outMinimum,
+            this.#readyBudget,
+          );
+          if ("limit" in outEstimate) {
+            throw new GatewayError(
+              502,
+              `${ONECLICK_NAME} takes ${chain.symbol} into ${origin.symbol} from ${String(outEstimate.minFrom)}, above the minimum of the relay.`,
+            );
+          }
+        }
       }
     }
-    this.#checkedAt = this.#now();
   }
 
   /** The tokens of a pair, or a refusal when the relay has no name of the coin of origin at 1Click or the rate is not served. */
@@ -434,6 +564,22 @@ export class OneClick implements PayExchanger {
     return minimum;
   }
 
+  /** The tokens of a pair of the way out, or a refusal when the relay has no name of the coin that arrives at 1Click. */
+  #outPair(asset: ChainAsset, to: FromAsset): [Token, Token] {
+    const destination = ORIGINS[to];
+    if (destination === undefined) {
+      throw new GatewayError(502, `${ONECLICK_NAME} does not pay out ${to.toUpperCase()}.`);
+    }
+    return [CHAIN_TOKENS[asset], destination];
+  }
+
+  /** The least of [asset] on Robinhood Chain that the relay sends through 1Click into [to]. */
+  #outMinimum(asset: ChainAsset, to: FromAsset): number {
+    const minimum = ONECLICK_MIN_OUT[to]?.[asset];
+    if (minimum === undefined) throw new GatewayError(502, `${ONECLICK_NAME} does not pay out ${to.toUpperCase()}.`);
+    return minimum;
+  }
+
   /** The refund address of a dry quote of [from], which belongs to nobody. */
   #dryRefund(from: FromAsset): string {
     const address = DRY_REFUNDS[from];
@@ -441,25 +587,30 @@ export class OneClick implements PayExchanger {
     return address;
   }
 
-  /** One dry quote, read as an estimate, or the floor of the bridge when 1Click refuses the amount as too low (R-29). */
+  /**
+   * One dry quote of [fromAmount] of [origin] into [to], for [recipient] with a refund to [refundTo], both addresses
+   * of nobody, read as an estimate; or the floor of the bridge, in the coin of origin and never under [minimum], when
+   * 1Click refuses the amount as too low (R-29).
+   */
   async #estimate(
-    from: FromAsset,
     origin: Token,
     to: Token,
     fromAmount: string,
+    recipient: string,
+    refundTo: string,
+    minimum: number,
     budget: CallLimiter = this.#estimateBudget,
   ): Promise<PayEstimate | PayOutOfRange> {
-    const refundTo = this.#dryRefund(from);
     let answer: Json;
     try {
-      ({ answer } = await this.#quote(true, origin, to, fromAmount, DRY_RECIPIENT, refundTo, budget));
+      ({ answer } = await this.#quote(true, origin, to, fromAmount, recipient, refundTo, budget));
     } catch (error) {
       const floor =
         error instanceof UpstreamError && error.status === 400
           ? fromBaseUnits(BRIDGE_FLOOR.exec(error.message)?.[1], origin.decimals)
           : null;
       if (floor === null) throw error;
-      return { limit: "below", minFrom: Math.max(floor, this.#minimum(from)), maxFrom: null };
+      return { limit: "below", minFrom: Math.max(floor, minimum), maxFrom: null };
     }
     const quote = requireObject(answer, "quote");
     return {

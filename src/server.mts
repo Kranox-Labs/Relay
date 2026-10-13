@@ -1,12 +1,16 @@
 // The HTTP interface of the relay for the app. It holds the API keys of the exchangers, so that no key ever sits in the
 // app, and it forwards only the calls of the bridge, with checked input: receive, a coin on Robinhood Chain into XMR,
-// and pay, an amount of a coin of origin, XMR on Monero, STRK on Starknet, or ZEC on Zcash (from 13 Oct 2026), into a coin for an
-// address on Robinhood Chain at a fixed or a floating rate. It also holds the key of Blockscout for the privacy scan
+// for the Mac app; pay, an amount of a coin of origin, XMR on Monero, STRK on Starknet, or ZEC on Zcash (from 13 Oct
+// 2026), into a coin for an address on Robinhood Chain at a fixed or a floating rate; and out (from 13 Oct 2026), an
+// amount of a coin on Robinhood Chain into one of those coins for an address of its chain, at the floating rate, with
+// the refund to the wallet on Robinhood Chain that sends. It also holds the key of Blockscout for the privacy scan
 // of an address on Robinhood Chain, so that the explorer sees the relay and not the user. It writes no log of a
 // request: no amount, no address, and no id leaves it except toward an exchanger or Blockscout and back to the app.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { EVM_ADDRESS_PATTERN, type ChainScanner } from "./scan.mts";
 import {
+  CHAIN_ASSET_DECIMALS,
+  CHAIN_ASSET_LABELS,
   CHAIN_ASSET_NAMES,
   FROM_ASSET_DECIMALS,
   FROM_ASSET_LABELS,
@@ -221,6 +225,15 @@ function readProvider(parts: RelayParts, value: unknown): { id: ProviderId; exch
 }
 
 /**
+ * The exchanger of a request of the way out, which every client names: no app sent one before the provider field,
+ * so a request without one is a fault of a client, and no default stands in (R-40 of the scan of 13 Oct 2026).
+ */
+function readOutProvider(parts: RelayParts, value: unknown): { id: ProviderId; exchanger: PayExchanger } {
+  if (value === undefined) throw new RequestError(400, `The provider must be one of: ${PROVIDER_IDS.join(", ")}.`);
+  return readProvider(parts, value);
+}
+
+/**
  * The coin of origin of a payment, or XMR when the request names none, as the Mac app sends it. An empty or null one
  * is a fault of a client, not a choice.
  */
@@ -229,6 +242,13 @@ function readFrom(value: unknown): FromAsset {
   const from = FROM_ASSET_NAMES.find((name) => name === value);
   if (from !== undefined) return from;
   throw new RequestError(400, `The coin of origin (from) must be one of: ${FROM_ASSET_NAMES.join(", ")}.`);
+}
+
+/** The coin of a private chain that a swap out pays: named in every request, since no app has a default for it. */
+function readTo(value: unknown): FromAsset {
+  const to = FROM_ASSET_NAMES.find((name) => name === value);
+  if (to !== undefined) return to;
+  throw new RequestError(400, `The coin of destination (to) must be one of: ${FROM_ASSET_NAMES.join(", ")}.`);
 }
 
 /**
@@ -255,6 +275,13 @@ function checkServes(exchanger: PayExchanger, from: FromAsset, rate: PayRate): v
     throw new RequestError(422, `${exchanger.name} does not take ${FROM_ASSET_LABELS[from]}.`);
   }
   if (!exchanger.rates.includes(rate)) throw new RequestError(422, `${exchanger.name} has no ${rate} rate.`);
+}
+
+/** Refuses a coin that [exchanger] does not pay out before any call reaches it. */
+function checkPaysOut(exchanger: PayExchanger, to: FromAsset): void {
+  if (!exchanger.destinations.includes(to)) {
+    throw new RequestError(422, `${exchanger.name} does not pay out ${FROM_ASSET_LABELS[to]}.`);
+  }
 }
 
 function readAmount(value: unknown): string {
@@ -285,6 +312,16 @@ function readFromAmount(from: FromAsset, fromAmount: unknown, xmrAmount: unknown
   const decimals = FROM_ASSET_DECIMALS[from];
   if (decimalsOf(amount) > decimals) {
     throw new RequestError(400, `An amount of ${FROM_ASSET_LABELS[from]} has at most ${decimals} decimals.`);
+  }
+  return amount;
+}
+
+/** The amount of a coin on Robinhood Chain of a swap out, with no more decimals than the coin holds (R-21). */
+function readOutAmount(asset: ChainAsset, fromAmount: unknown): string {
+  const amount = readAmount(fromAmount);
+  const decimals = CHAIN_ASSET_DECIMALS[asset];
+  if (decimalsOf(amount) > decimals) {
+    throw new RequestError(400, `An amount of ${CHAIN_ASSET_LABELS[asset]} has at most ${decimals} decimals.`);
   }
   return amount;
 }
@@ -459,6 +496,37 @@ function payMismatch(
   }
   if (!pairMatches(created, exchanger.payNames(from, asset, rate)))
     return `${name} made the exchange for another pair of coins.`;
+  return null;
+}
+
+/** Why an exchange of the way out differs from its request, or null when it matches. */
+function outMismatch(
+  exchanger: PayExchanger,
+  created: CreatedExchange,
+  asset: ChainAsset,
+  to: FromAsset,
+  fromAmount: string,
+  address: string,
+  refundAddress: string,
+): string | null {
+  const name = exchanger.name;
+  const destination = ORIGIN_ADDRESSES[to];
+  // The wallet on Robinhood Chain sends to the deposit address, so it must be one of that chain.
+  if (!EVM_ADDRESS_PATTERN.test(created.payinAddress)) {
+    return `${name} gave a deposit address that is not a Robinhood Chain address.`;
+  }
+  if (!destination.same(created.payoutAddress, address)) {
+    return `${name} made the exchange for another ${FROM_ASSET_LABELS[to]} address.`;
+  }
+  if (!refundMatches(created, refundAddress, sameEvmAddress)) {
+    return `${name} made the exchange with another refund address.`;
+  }
+  if (!amountsMatch(fromAmount, created.fromAmount)) {
+    return `${name} made the exchange for another amount of ${CHAIN_ASSET_LABELS[asset]}.`;
+  }
+  if (!pairMatches(created, exchanger.outNames(asset, to))) {
+    return `${name} made the exchange for another pair of coins.`;
+  }
   return null;
 }
 
@@ -677,6 +745,111 @@ async function createPay(parts: RelayParts, request: IncomingMessage, url: URL, 
   });
 }
 
+async function outRange(parts: RelayParts, url: URL): Promise<unknown> {
+  const { id: provider, exchanger } = readOutProvider(parts, url.searchParams.get("provider") ?? undefined);
+  const asset = readAsset(url.searchParams.get("from"));
+  const to = readTo(url.searchParams.get("to"));
+  checkPaysOut(exchanger, to);
+  const range = await exchanger.outRange(asset, to);
+  return { provider, from: asset, to, minFrom: range.minFrom, maxFrom: range.maxFrom };
+}
+
+async function outQuote(parts: RelayParts, url: URL): Promise<unknown> {
+  const { id: provider, exchanger } = readOutProvider(parts, url.searchParams.get("provider") ?? undefined);
+  const asset = readAsset(url.searchParams.get("from"));
+  const to = readTo(url.searchParams.get("to"));
+  const fromAmount = readOutAmount(asset, url.searchParams.get("fromAmount") ?? undefined);
+  checkPaysOut(exchanger, to);
+  const estimate = await exchanger.outEstimate(asset, to, fromAmount);
+  // An amount outside the range gets no estimate; the app shows the range of the coin on Robinhood Chain instead.
+  if ("limit" in estimate) {
+    return {
+      provider,
+      from: asset,
+      to,
+      fromAmount,
+      amount: null,
+      validUntil: null,
+      warning: null,
+      depositFee: null,
+      withdrawalFee: null,
+      speedMinutes: null,
+      limit: estimate.limit,
+      minFrom: estimate.minFrom,
+      maxFrom: estimate.maxFrom,
+    };
+  }
+  return {
+    provider,
+    from: asset,
+    to,
+    fromAmount,
+    amount: estimate.amount,
+    validUntil: estimate.validUntil,
+    warning: estimate.warning,
+    depositFee: estimate.depositFee,
+    withdrawalFee: estimate.withdrawalFee,
+    speedMinutes: estimate.speedMinutes,
+    limit: null,
+    minFrom: null,
+    maxFrom: null,
+  };
+}
+
+/**
+ * A swap out: an amount of a coin on Robinhood Chain into a coin of a private chain for an address of that chain, at
+ * the floating rate, with the refund to the wallet on Robinhood Chain that sends the deposit.
+ */
+async function createOut(parts: RelayParts, request: IncomingMessage, url: URL, raw: Buffer): Promise<unknown> {
+  // The provider of a creation stands in the body, with the rest of the request, and nowhere else (R-04).
+  if (url.searchParams.has("provider")) {
+    throw new RequestError(400, "The provider of a creation goes in the body of the request, not in its query.");
+  }
+  const body = parseBody(raw);
+  const { id: provider, exchanger } = readOutProvider(parts, body.provider);
+  const asset = readAsset(body.from);
+  const to = readTo(body.to);
+  const fromAmount = readOutAmount(asset, body.fromAmount);
+  checkPaysOut(exchanger, to);
+  // A swap out has the floating rate alone: a request that names another rate, or a rate id, asks for something the
+  // relay does not serve.
+  if (body.rate !== undefined && body.rate !== "floating") {
+    throw new RequestError(400, "A swap out has a floating rate alone.");
+  }
+  if (body.rateId !== undefined && body.rateId !== null) {
+    throw new RequestError(400, "A swap out takes no rate id.");
+  }
+  const destination = ORIGIN_ADDRESSES[to];
+  const address = body.address;
+  if (typeof address !== "string" || !destination.isRefund(address)) {
+    throw new RequestError(400, `The address must be ${destination.refundWords}.`);
+  }
+  const refundAddress = body.refundAddress;
+  if (typeof refundAddress !== "string" || !EVM_ADDRESS_PATTERN.test(refundAddress)) {
+    throw new RequestError(400, "The refund address must be a Robinhood Chain address: 0x and 40 hex digits.");
+  }
+  const fields = { route: "out", provider, from: asset, to, fromAmount, address, refundAddress };
+  return parts.creations.run(header(request, CREATION_KEY_HEADER), fields, async () => {
+    const created = await exchanger.createOut(asset, to, fromAmount, address, refundAddress);
+    // The wallet sends the coins to the deposit address and trusts the address of destination, so the relay passes on
+    // nothing else.
+    checkCreated(exchanger, created, outMismatch(exchanger, created, asset, to, fromAmount, address, refundAddress));
+    return {
+      id: created.id,
+      provider,
+      from: asset,
+      to,
+      amount: created.toAmount,
+      fromAmount: created.fromAmount,
+      depositAddress: created.payinAddress,
+      payoutAddress: created.payoutAddress,
+      refundAddress: recordedRefund(created),
+      validUntil: created.validUntil,
+      readToken: parts.tokens.issue(created.id, provider),
+    };
+  });
+}
+
 /**
  * Lets a read of a swap pass when it carries the token of the swap, or, while the older apps run, no token at all; a
  * token of another swap never passes.
@@ -750,6 +923,9 @@ async function route(parts: RelayParts, request: IncomingMessage, raw: Buffer): 
   if (method === "GET" && url.pathname === "/v1/pay/range") return [200, await payRange(parts, url)];
   if (method === "GET" && url.pathname === "/v1/pay/quote") return [200, await payQuote(parts, url)];
   if (method === "POST" && url.pathname === "/v1/pay/swaps") return [201, await createPay(parts, request, url, raw)];
+  if (method === "GET" && url.pathname === "/v1/out/range") return [200, await outRange(parts, url)];
+  if (method === "GET" && url.pathname === "/v1/out/quote") return [200, await outQuote(parts, url)];
+  if (method === "POST" && url.pathname === "/v1/out/swaps") return [201, await createOut(parts, request, url, raw)];
   if (method === "GET" && url.pathname === "/v1/scan/robinhood") return [200, await scanAddress(scanner, url)];
   const swap = SWAP_PATH.exec(url.pathname);
   if (method === "GET" && swap) return [200, await readSwap(parts, request, url, decodeURIComponent(swap[1]))];

@@ -10,7 +10,9 @@
 // floating rate: amountFrom "0.1", expectedAmount "0.1", amountTo "107.647781", status "waiting"; until then the
 // relay read expectedAmount as the coin that arrives, R-38 of the scan of that day). The key allows 50 calls in a
 // window (the headers x-ratelimit-limit and x-ratelimit-reset, about a minute apart), so the relay keeps the ranges
-// for a while and stays under it.
+// for a while and stays under it. The way out, from 13 Oct 2026, is the same pair the other way round at the floating
+// rate: CHECKED 13 Oct 2026 with the key, from the network "robinhood" USDG into XMR from 12.52 and into ZEC from
+// 28.67, ETH into XMR from 0.0045 and into ZEC from 0.0109; v3 lists no STRK ("Failed to find currency 'strk_strk'").
 import {
   SIMPLESWAP_BASE_URL,
   SIMPLESWAP_CALLS_PER_MINUTE,
@@ -49,9 +51,9 @@ const CHAIN_SIDES: Record<ChainAsset, Side> = {
 const XMR: Side = { currency: "xmr", network: "xmr" };
 
 /**
- * The coins of origin that the relay sends through SimpleSwap: XMR, and ZEC on the network "zec" (CHECKED 13 Oct
- * 2026 with the key: into USDG on Robinhood Chain from 0.0238 ZEC at the floating rate and from 0.0187 to 0.66 at the
- * fixed one). NOT CHECKED: whether v3 lists STRK.
+ * The coins of the private chains that the relay sends through SimpleSwap, in and out: XMR, and ZEC on the network
+ * "zec" (CHECKED 13 Oct 2026 with the key: into USDG on Robinhood Chain from 0.0238 ZEC at the floating rate and from
+ * 0.0187 to 0.66 at the fixed one). CHECKED 13 Oct 2026: v3 lists no STRK.
  */
 const FROM_SIDES: Partial<Record<FromAsset, Side>> = { xmr: XMR, zec: { currency: "zec", network: "zec" } };
 
@@ -101,6 +103,19 @@ function pairQuery(from: FromAsset, asset: ChainAsset, rate: PayRate): Record<st
   };
 }
 
+/** The query of a pair of the way out: a coin on Robinhood Chain into a coin of a private chain, at the floating rate. */
+function outQuery(asset: ChainAsset, to: FromAsset): Record<string, string> {
+  const from = CHAIN_SIDES[asset];
+  const destination = fromSide(to);
+  return {
+    tickerFrom: from.currency,
+    networkFrom: from.network,
+    tickerTo: destination.currency,
+    networkTo: destination.network,
+    fixed: "false",
+  };
+}
+
 /** A number that v3 writes as text, such as "0.0246892632". */
 function requireAmount(data: Json, field: string): number {
   const value = amountOrNull(data[field]);
@@ -142,6 +157,7 @@ export class SimpleSwap implements PayExchanger {
   // The coins of origin come from the one table of their sides, so that none can be left out of the other (R-34).
   readonly origins: readonly FromAsset[] = Object.keys(FROM_SIDES) as FromAsset[];
   readonly rates: readonly PayRate[] = PAY_RATE_NAMES;
+  readonly destinations: readonly FromAsset[] = Object.keys(FROM_SIDES) as FromAsset[];
   readonly #apiKey: string;
   readonly #fetch: typeof fetch;
   readonly #now: () => number;
@@ -162,6 +178,7 @@ export class SimpleSwap implements PayExchanger {
    */
   async ready(): Promise<void> {
     for (const from of this.origins) await this.payRange(from, "eth", "fixed");
+    for (const to of this.destinations) await this.outRange("usdg", to);
   }
 
   async payRange(from: FromAsset, asset: ChainAsset, rate: PayRate): Promise<PayRange> {
@@ -185,19 +202,39 @@ export class SimpleSwap implements PayExchanger {
     const key = `${from}:${asset}:${rate}:${fromAmount}`;
     const kept = this.#estimates.get(key);
     if (kept !== undefined && this.#now() - kept.at < SIMPLESWAP_ESTIMATE_CACHE_MS) return kept.value;
-    const value = await this.#askEstimate(from, asset, rate, fromAmount);
+    const value = await this.#askEstimate(pairQuery(from, asset, rate), rate, fromAmount);
     if (this.#estimates.size >= SIMPLESWAP_ESTIMATE_CACHE_ENTRIES) this.#estimates.clear();
     this.#estimates.set(key, { value, at: this.#now() });
     return value;
   }
 
+  async outRange(asset: ChainAsset, to: FromAsset): Promise<PayRange> {
+    const key = `out:${asset}:${to}`;
+    const kept = this.#ranges.get(key);
+    if (kept !== undefined && this.#now() - kept.at < SIMPLESWAP_RANGE_CACHE_MS) return kept.value;
+    const data = await this.#call(`/v3/ranges?${new URLSearchParams(outQuery(asset, to))}`);
+    const value = { minFrom: requireAmount(data, "min"), maxFrom: amountOrNull(data.max) };
+    this.#ranges.set(key, { value, at: this.#now() });
+    return value;
+  }
+
+  async outEstimate(asset: ChainAsset, to: FromAsset, fromAmount: string): Promise<PayEstimate | PayOutOfRange> {
+    const key = `out:${asset}:${to}:${fromAmount}`;
+    const kept = this.#estimates.get(key);
+    if (kept !== undefined && this.#now() - kept.at < SIMPLESWAP_ESTIMATE_CACHE_MS) return kept.value;
+    const value = await this.#askEstimate(outQuery(asset, to), "floating", fromAmount);
+    if (this.#estimates.size >= SIMPLESWAP_ESTIMATE_CACHE_ENTRIES) this.#estimates.clear();
+    this.#estimates.set(key, { value, at: this.#now() });
+    return value;
+  }
+
+  /** One estimate of v3 for the [pair] at [rate], or the range when the amount falls outside it. */
   async #askEstimate(
-    from: FromAsset,
-    asset: ChainAsset,
+    pair: Record<string, string>,
     rate: PayRate,
     fromAmount: string,
   ): Promise<PayEstimate | PayOutOfRange> {
-    const query = new URLSearchParams({ ...pairQuery(from, asset, rate), amount: fromAmount });
+    const query = new URLSearchParams({ ...pair, amount: fromAmount });
     let data: Json;
     try {
       data = await this.#call(`/v3/estimates?${query}`);
@@ -240,7 +277,41 @@ export class SimpleSwap implements PayExchanger {
       userRefundAddress: refundAddress,
     };
     if (rateId !== null) body.rateId = rateId;
-    const data = await this.#call("/v3/exchanges", { method: "POST", body: JSON.stringify(body) });
+    return this.#created(await this.#call("/v3/exchanges", { method: "POST", body: JSON.stringify(body) }));
+  }
+
+  payNames(from: FromAsset, asset: ChainAsset, rate: PayRate): PairNames {
+    return { from: fromSide(from), to: CHAIN_SIDES[asset], flow: RATE_TYPES[rate] };
+  }
+
+  async createOut(
+    asset: ChainAsset,
+    to: FromAsset,
+    fromAmount: string,
+    address: string,
+    refundAddress: string,
+  ): Promise<CreatedExchange> {
+    const from = CHAIN_SIDES[asset];
+    const destination = fromSide(to);
+    const body: Json = {
+      tickerFrom: from.currency,
+      networkFrom: from.network,
+      tickerTo: destination.currency,
+      networkTo: destination.network,
+      amount: fromAmount,
+      addressTo: address,
+      fixed: false,
+      userRefundAddress: refundAddress,
+    };
+    return this.#created(await this.#call("/v3/exchanges", { method: "POST", body: JSON.stringify(body) }));
+  }
+
+  outNames(asset: ChainAsset, to: FromAsset): PairNames {
+    return { from: CHAIN_SIDES[asset], to: fromSide(to), flow: RATE_TYPES.floating };
+  }
+
+  /** An exchange as v3 answers its creation. */
+  #created(data: Json): CreatedExchange {
     // The coin that arrives is amountTo, an estimate while the exchange runs and the fact once it is done; expectedAmount
     // is the deposit that SimpleSwap expects, in the coin of origin (R-38).
     const toAmount = amountOrNull(data.amountTo);
@@ -261,10 +332,6 @@ export class SimpleSwap implements PayExchanger {
       flow: requireString(data, "type"),
       validUntil: stringOrNull(data.validUntil),
     };
-  }
-
-  payNames(from: FromAsset, asset: ChainAsset, rate: PayRate): PairNames {
-    return { from: fromSide(from), to: CHAIN_SIDES[asset], flow: RATE_TYPES[rate] };
   }
 
   async status(id: string): Promise<ExchangeStatus> {

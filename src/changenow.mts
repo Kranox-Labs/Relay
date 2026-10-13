@@ -13,7 +13,10 @@
 // Kranox, Starknet is the network "strk" (the network "starknet" answers "Currency strk is not supported"), and STRK
 // into USDG on Robinhood Chain ranges from 18.88 STRK at the floating rate and from 110.06 to 9142.31 at the fixed one.
 // ZEC is "zec" on the network "zec": into USDG from 0.0234 ZEC at the floating rate and from 0.0183 to 0.66 at the
-// fixed one, 1 ZEC at 1192.47 USDG with a deposit fee of 0.01 ZEC (CHECKED 13 Oct 2026, the same key).
+// fixed one, 1 ZEC at 1192.47 USDG with a deposit fee of 0.01 ZEC (CHECKED 13 Oct 2026, the same key). The way out,
+// from 13 Oct 2026, is the pair of receive for any of the three coins at the standard flow: CHECKED 13 Oct 2026 with
+// the same key, USDG on "hood" into XMR from 12.27, into ZEC from 28.10, and into STRK from 1.65; ETH into XMR from
+// 0.0044, into ZEC from 0.0107, and into STRK from 0.00018; no top; "10-60" minutes; a deposit fee of about 0.7 USDG.
 import { CHANGENOW_BASE_URL, MIN_AMOUNT_CACHE_MS, UPSTREAM_CALLS_PER_SECOND, UPSTREAM_TIMEOUT_MS } from "./config.mts";
 import {
   FROM_ASSET_NAMES,
@@ -89,16 +92,22 @@ function outOfRange(error: UpstreamError): PayOutOfRange | null {
   };
 }
 
-/** The pair of receive in a query of v2: a coin on Robinhood Chain into XMR, at the floating rate. */
-function receivePair(asset: ChainAsset): Record<string, string> {
+/** The pair of the way out in a query of v2: a coin on Robinhood Chain into a coin of a private chain, at the floating rate. */
+function outPair(asset: ChainAsset, to: FromAsset): Record<string, string> {
   const from = CHAIN_ASSETS[asset];
+  const destination = FROM_SIDES[to];
   return {
     fromCurrency: from.currency,
     fromNetwork: from.network,
-    toCurrency: XMR.currency,
-    toNetwork: XMR.network,
+    toCurrency: destination.currency,
+    toNetwork: destination.network,
     flow: STANDARD_FLOW,
   };
+}
+
+/** The pair of receive in a query of v2: a coin on Robinhood Chain into XMR, at the floating rate. */
+function receivePair(asset: ChainAsset): Record<string, string> {
+  return outPair(asset, "xmr");
 }
 
 /** What a ChangeNow takes besides its key. The tests pass a fake fetch and a clock of their own. */
@@ -111,6 +120,7 @@ export class ChangeNow implements Exchanger {
   readonly name = CHANGENOW_NAME;
   readonly origins: readonly FromAsset[] = FROM_ASSET_NAMES;
   readonly rates: readonly PayRate[] = PAY_RATE_NAMES;
+  readonly destinations: readonly FromAsset[] = FROM_ASSET_NAMES;
   readonly #apiKey: string;
   readonly #fetch: typeof fetch;
   readonly #now: () => number;
@@ -245,6 +255,47 @@ export class ChangeNow implements Exchanger {
 
   receiveNames(asset: ChainAsset): PairNames {
     return { from: CHAIN_ASSETS[asset], to: XMR, flow: STANDARD_FLOW };
+  }
+
+  async outRange(asset: ChainAsset, to: FromAsset): Promise<PayRange> {
+    const data = await this.#call(`/v2/exchange/range?${new URLSearchParams(outPair(asset, to))}`);
+    return { minFrom: requireNumber(data, "minAmount"), maxFrom: numberOrNull(data.maxAmount) };
+  }
+
+  async outEstimate(asset: ChainAsset, to: FromAsset, fromAmount: string): Promise<PayEstimate | PayOutOfRange> {
+    const query = new URLSearchParams({ ...outPair(asset, to), fromAmount, type: DIRECT_TYPE });
+    let data: Json;
+    try {
+      data = await this.#call(`/v2/exchange/estimated-amount?${query}`);
+    } catch (error) {
+      const range = error instanceof UpstreamError ? outOfRange(error) : null;
+      if (range !== null) return range;
+      throw error;
+    }
+    return {
+      amount: requireNumber(data, "toAmount"),
+      rateId: null,
+      validUntil: stringOrNull(data.validUntil),
+      warning: stringOrNull(data.warningMessage),
+      depositFee: numberOrNull(data.depositFee),
+      withdrawalFee: numberOrNull(data.withdrawalFee),
+      speedMinutes: stringOrNull(data.transactionSpeedForecast),
+    };
+  }
+
+  async createOut(
+    asset: ChainAsset,
+    to: FromAsset,
+    fromAmount: string,
+    address: string,
+    refundAddress: string,
+  ): Promise<CreatedExchange> {
+    const body: Json = { ...outPair(asset, to), fromAmount, address, refundAddress, type: DIRECT_TYPE };
+    return this.#created(await this.#call("/v2/exchange", { method: "POST", body: JSON.stringify(body) }));
+  }
+
+  outNames(asset: ChainAsset, to: FromAsset): PairNames {
+    return { from: CHAIN_ASSETS[asset], to: FROM_SIDES[to], flow: STANDARD_FLOW };
   }
 
   async status(id: string): Promise<ExchangeStatus> {
