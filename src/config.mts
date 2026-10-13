@@ -56,7 +56,7 @@ export const SIMPLESWAP_ESTIMATE_CACHE_MS = 10_000;
 export const SIMPLESWAP_ESTIMATE_CACHE_ENTRIES = 200;
 
 /**
- * The 1Click API of NEAR Intents, the exchanger of Starknet from 13 Oct 2026: a quote is one POST, dry for an
+ * The 1Click API of NEAR Intents, the exchanger of Starknet and Zcash from 13 Oct 2026: a quote is one POST, dry for an
  * estimate and real for a swap, and the state of a swap comes by its deposit address (CHECKED 13 Oct 2026, its OpenAPI
  * file at /docs/v0/openapi.yaml).
  */
@@ -89,7 +89,9 @@ export const ONECLICK_TOKENS_CACHE_MS = 10 * 60_000;
 
 /**
  * A swap at 1Click takes its deposit until this long after its quote, then refunds what came late. The deposit comes
- * from the wallet of the user on Starknet, which takes a minute; the fixed rate of ChangeNOW waits about as long.
+ * from the wallet of the user on Starknet, which takes a minute, or on Zcash, whose block comes every 75 seconds, so
+ * that a deposit sent in the last minutes is in a block before the deadline; the fixed rate of ChangeNOW waits about
+ * as long.
  */
 export const ONECLICK_DEADLINE_MS = 20 * 60_000;
 
@@ -103,11 +105,13 @@ export const ONECLICK_QUOTE_WAIT_MS = 2_000;
 export const ONECLICK_REFERRAL = "kranox";
 
 /**
- * The least of each coin of origin that the relay sends through 1Click, which names no minimum of its own: CHECKED
- * 13 Oct 2026, 1 STRK quoted 0.011 USDG after the withdraw fee of 0.075 USDG, and 20 STRK 1.655 USDG. The fee is the
- * same for any amount, so the minimum keeps it below a twentieth of what arrives. ChangeNOW takes STRK from 18.88.
+ * The least of each coin of origin that the relay sends through 1Click, which names no minimum of its own for STRK:
+ * CHECKED 13 Oct 2026, 1 STRK quoted 0.011 USDG after the withdraw fee of 0.075 USDG, and 20 STRK 1.655 USDG. The
+ * fee is the same for any amount, so the minimum keeps it below a twentieth of what arrives. ChangeNOW takes STRK
+ * from 18.88. For ZEC the bridge of 1Click has a floor of 0.00132 ZEC; 0.005 ZEC quoted 6.04 USDG, with the same fee
+ * of 0.075 USDG, and ChangeNOW takes ZEC from 0.0234.
  */
-export const ONECLICK_MIN_FROM: Readonly<Partial<Record<FromAsset, number>>> = { strk: 20 };
+export const ONECLICK_MIN_FROM: Readonly<Partial<Record<FromAsset, number>>> = { strk: 20, zec: 0.005 };
 
 /** A call to ChangeNOW that takes longer than this fails, so that the app does not wait without end. */
 export const UPSTREAM_TIMEOUT_MS = 20_000;

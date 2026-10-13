@@ -201,7 +201,7 @@ test("the limiter refills at its rate and never holds more than one second of ca
 test("asks v2 for STRK on the network strk, and gives a range in the coin of origin", async () => {
   const { fetchImpl, sent } = fakeFetch(() => Response.json({ minAmount: 18.8802983, maxAmount: null }));
   const changenow = new ChangeNow(KEY, { fetchImpl });
-  assert.deepEqual(changenow.origins, ["xmr", "strk"]);
+  assert.deepEqual(changenow.origins, ["xmr", "strk", "zec"]);
   assert.deepEqual(await changenow.payRange("strk", "usdg", "floating"), { minFrom: 18.8802983, maxFrom: null });
   const url = new URL(sent[0].url);
   assert.equal(url.pathname, "/v2/exchange/range");

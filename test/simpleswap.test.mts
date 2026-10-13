@@ -145,8 +145,8 @@ test("creates an exchange with the names of v3 and reads back what the relay che
       tickerTo: "usdg",
       networkTo: "robinhood",
       amountFrom: "0.1",
-      expectedAmount: "47.953709",
-      amountTo: null,
+      expectedAmount: "0.1",
+      amountTo: "47.953709",
       addressFrom: DEPOSIT,
       addressTo: RECIPIENT,
       userRefundAddress: REFUND,
@@ -202,7 +202,27 @@ test("creates an exchange with the names of v3 and reads back what the relay che
     }),
   );
   const made = await new SimpleSwap(KEY, floating).createPay("xmr", "eth", "floating", "1", RECIPIENT, REFUND, null);
-  assert.equal(made.toAmount, 2, "amountTo serves when expectedAmount is missing");
+  assert.equal(made.toAmount, 2, "the coin that arrives is amountTo");
+  const withoutAmountTo = fakeFetch(() =>
+    result({
+      id: "x",
+      amountFrom: "1",
+      expectedAmount: "1",
+      amountTo: null,
+      addressFrom: DEPOSIT,
+      addressTo: RECIPIENT,
+      tickerFrom: "xmr",
+      networkFrom: "xmr",
+      tickerTo: "eth",
+      networkTo: "robinhood",
+      type: "floating",
+    }),
+  );
+  await assert.rejects(
+    new SimpleSwap(KEY, withoutAmountTo).createPay("xmr", "eth", "floating", "1", RECIPIENT, REFUND, null),
+    /without the amount that arrives/,
+    "expectedAmount is the deposit, never the coin that arrives (R-38)",
+  );
   assert.equal("rateId" in JSON.parse(String(floating.sent[0].init.body)), false, "a floating rate sends no rate id");
 });
 
@@ -213,8 +233,8 @@ test("reads the state of an exchange in the words of the app, and refuses a stat
       : result({
           id: "pch7l7kd1v2mzh1",
           status: "exchanging",
-          amountTo: null,
-          expectedAmount: "47.953709",
+          amountTo: "47.953709",
+          expectedAmount: "0.1",
           txFrom: "deposit-hash",
           txTo: null,
           userRefundAddress: REFUND,
@@ -294,7 +314,7 @@ test("refuses a created exchange without the names of its pair, so that the chec
     result({
       id: "x",
       amountFrom: "1",
-      expectedAmount: "2",
+      amountTo: "2",
       addressFrom: DEPOSIT,
       addressTo: RECIPIENT,
       type: "fixed",
@@ -344,10 +364,14 @@ test("keeps a quote for a few seconds, so that the pages of the app spend one ca
   assert.equal(sent.length, 3, "an old quote is asked for again");
 });
 
-test("takes XMR alone, and says so for another coin before any call", async () => {
-  const { fetchImpl, sent } = fakeFetch(() => result({ min: "1", max: null }));
+test("takes XMR and ZEC, and says so for another coin before any call", async () => {
+  const { fetchImpl, sent } = fakeFetch(() => result({ min: "0.02383414", max: null }));
   const simpleswap = new SimpleSwap(KEY, { fetchImpl });
-  assert.deepEqual(simpleswap.origins, ["xmr"]);
+  assert.deepEqual(simpleswap.origins, ["xmr", "zec"]);
+  assert.deepEqual(await simpleswap.payRange("zec", "usdg", "floating"), { minFrom: 0.02383414, maxFrom: null });
+  assert.equal(new URL(sent[0].url).searchParams.get("tickerFrom"), "zec");
+  assert.equal(new URL(sent[0].url).searchParams.get("networkFrom"), "zec");
+  sent.length = 0;
   await assert.rejects(simpleswap.payRange("strk", "usdg", "floating"), (error: unknown) => {
     assert.ok(error instanceof GatewayError);
     assert.match(error.message, /does not take STRK/);

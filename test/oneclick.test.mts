@@ -10,6 +10,8 @@ import {
 } from "../src/config.mts";
 import { GatewayError, UpstreamError } from "../src/exchanger.mts";
 import { OneClick, fromBaseUnits, toBaseUnits } from "../src/oneclick.mts";
+import { isStarknetAddress } from "../src/starknet.mts";
+import { isZcashTransparentAddress } from "../src/zcash.mts";
 
 const KEY = "test-jwt-of-near-intents";
 // The recipient in the checksum case of EIP-55, which 1Click refuses, and as the relay sends it.
@@ -125,7 +127,7 @@ test("writes amounts in base units and reads them back", () => {
 test("names its range without a call, and refuses an amount below the minimum of the relay without one", async () => {
   const { fetchImpl, sent } = fakeFetch(() => refusal(500, "never asked"));
   const oneclick = new OneClick(KEY, { fetchImpl });
-  assert.deepEqual(oneclick.origins, ["strk"]);
+  assert.deepEqual(oneclick.origins, ["strk", "zec"]);
   assert.deepEqual(await oneclick.payRange("strk", "usdg", "floating"), {
     minFrom: ONECLICK_MIN_FROM.strk,
     maxFrom: null,
@@ -187,6 +189,70 @@ test("estimates with a dry quote in base units, the key in a header only, and no
     await new OneClick(key, without).payEstimate("strk", "eth", "floating", "1000");
     assert.equal("authorization" in (without.sent[0].init.headers as Record<string, string>), false);
     assert.equal(body(without.sent[0]).destinationAsset, ETH);
+  }
+});
+
+test("takes ZEC at a transparent address, with its minimum and its minutes", async () => {
+  const { fetchImpl, sent } = fakeFetch((call) =>
+    quoteAnswer(body(call), {
+      amountIn: "500000",
+      amountInFormatted: "0.005",
+      amountOut: "6040294",
+      amountOutFormatted: "6.040294",
+      timeEstimate: 454,
+      refundFee: "32000",
+    }),
+  );
+  const oneclick = new OneClick(KEY, { fetchImpl });
+  assert.deepEqual(await oneclick.payRange("zec", "usdg", "floating"), {
+    minFrom: ONECLICK_MIN_FROM.zec,
+    maxFrom: null,
+  });
+  assert.deepEqual(await oneclick.payEstimate("zec", "usdg", "floating", "0.001"), {
+    limit: "below",
+    minFrom: ONECLICK_MIN_FROM.zec,
+    maxFrom: null,
+  });
+  const estimate = await oneclick.payEstimate("zec", "usdg", "floating", "0.005");
+  assert.ok(!("limit" in estimate));
+  assert.equal(estimate.amount, 6.040294);
+  assert.equal(estimate.speedMinutes, "8", "454 seconds, rounded up");
+  assert.equal(body(sent[0]).originAsset, "nep141:zec.omft.near");
+  assert.equal(body(sent[0]).amount, "500000", "0.005 ZEC in its 8 decimals");
+  assert.match(String(body(sent[0]).refundTo), /^t1/, "the refund address of a dry quote is one of Zcash");
+  // The floor of the bridge of 1Click, in base units, reads as the least that goes through (R-29).
+  const floored = fakeFetch(() => refusal(400, "Amount is too low for bridge, try at least 600000"));
+  assert.deepEqual(await new OneClick(KEY, floored).payEstimate("zec", "usdg", "floating", "0.005"), {
+    limit: "below",
+    minFrom: 0.006,
+    maxFrom: null,
+  });
+  const otherRefusal = fakeFetch(() => refusal(400, "recipient is not valid"));
+  await assert.rejects(new OneClick(KEY, otherRefusal).payEstimate("zec", "usdg", "floating", "0.005"), UpstreamError);
+  assert.deepEqual(oneclick.payNames("zec", "eth", "floating"), {
+    from: { currency: "nep141:zec.omft.near", network: "zec" },
+    to: { currency: ETH, network: "hood" },
+    flow: "EXACT_INPUT",
+  });
+});
+
+test("quotes dry with a refund address of the chain that belongs to nobody, and makes no swap for it (R-30)", async () => {
+  const checks = { strk: isStarknetAddress, zec: isZcashTransparentAddress } as const;
+  for (const [from, amount] of [
+    ["strk", "1000"],
+    ["zec", "0.1"],
+  ] as const) {
+    const { fetchImpl, sent } = fakeFetch((call) => quoteAnswer(body(call), { depositAddress: DEPOSIT }));
+    const oneclick = new OneClick(KEY, { fetchImpl });
+    await oneclick.payEstimate(from, "usdg", "floating", amount);
+    const refundTo = String(body(sent[0]).refundTo);
+    assert.equal(checks[from](refundTo), true, `${from}: the placeholder is an address of its chain`);
+    await assert.rejects(
+      oneclick.createPay(from, "usdg", "floating", amount, RECIPIENT, refundTo, null),
+      /addresses of a dry quote/,
+      from,
+    );
+    assert.equal(sent.length, 1, `${from}: no swap is made for the placeholder`);
   }
 });
 
@@ -421,12 +487,24 @@ test("checks the token list for /ready, and with a key one dry quote of the mini
   const oneclick = new OneClick(KEY, { fetchImpl, now: time.now });
   await oneclick.ready();
   assert.equal(new URL(sent[0].url).pathname, "/v0/tokens");
-  // With a partner key, one dry quote of the minimum shows that 1Click takes the key (R-23).
+  // With a partner key, one dry quote of the minimum of each coin shows that 1Click takes the key (R-23) and that the
+  // floor of its bridge lies under the minimum of the relay (R-29).
   assert.equal(new URL(sent[1].url).pathname, "/v0/quote");
   assert.equal(body(sent[1]).dry, true);
   assert.equal(body(sent[1]).amount, toBaseUnits(String(ONECLICK_MIN_FROM.strk), 18));
+  assert.equal(body(sent[2]).originAsset, "nep141:zec.omft.near");
+  assert.equal(body(sent[2]).amount, toBaseUnits(String(ONECLICK_MIN_FROM.zec), 8));
   await oneclick.ready();
-  assert.equal(sent.length, 2, "the check runs once in a while");
+  assert.equal(sent.length, 3, "the check runs once in a while");
+  // A floor of the bridge above the minimum of the relay fails the check.
+  const floored = fakeFetch((call) =>
+    new URL(call.url).pathname === "/v0/tokens"
+      ? Response.json(tokens)
+      : body(call).originAsset === "nep141:zec.omft.near"
+        ? refusal(400, "Amount is too low for bridge, try at least 600000")
+        : quoteAnswer(body(call)),
+  );
+  await assert.rejects(new OneClick(KEY, floored).ready(), /ZEC from 0.006, above the minimum/);
   time.advance(ONECLICK_TOKENS_CACHE_MS);
   list = tokens.filter((token) => token.symbol !== "USDG");
   await assert.rejects(oneclick.ready(), (error: unknown) => {

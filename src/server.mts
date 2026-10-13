@@ -1,6 +1,6 @@
 // The HTTP interface of the relay for the app. It holds the API keys of the exchangers, so that no key ever sits in the
 // app, and it forwards only the calls of the bridge, with checked input: receive, a coin on Robinhood Chain into XMR,
-// and pay, an amount of a coin of origin, XMR on Monero or STRK on Starknet (from 13 Oct 2026), into a coin for an
+// and pay, an amount of a coin of origin, XMR on Monero, STRK on Starknet, or ZEC on Zcash (from 13 Oct 2026), into a coin for an
 // address on Robinhood Chain at a fixed or a floating rate. It also holds the key of Blockscout for the privacy scan
 // of an address on Robinhood Chain, so that the explorer sees the relay and not the user. It writes no log of a
 // request: no amount, no address, and no id leaves it except toward an exchanger or Blockscout and back to the app.
@@ -25,6 +25,7 @@ import {
   type ProviderId,
 } from "./exchanger.mts";
 import { isStarknetAddress, sameStarknetAddress } from "./starknet.mts";
+import { isZcashTransparentAddress } from "./zcash.mts";
 import {
   AMOUNT_MATCH_TOLERANCE,
   MAX_BODY_BYTES,
@@ -56,7 +57,7 @@ export interface RelayParts {
   exchanger: Exchanger;
   /** SimpleSwap, the second exchanger of pay, or null when the relay has no key for it. */
   simpleswap: PayExchanger | null;
-  /** The 1Click API of NEAR Intents, the exchanger of Starknet, or null in a relay without it (the tests). */
+  /** The 1Click API of NEAR Intents, the exchanger of Starknet and Zcash, or null in a relay without it (the tests). */
   oneclick: PayExchanger | null;
   scanner: ChainScanner | null;
   tokens: SwapTokens;
@@ -80,7 +81,8 @@ const MONERO_DEPOSIT_PATTERN = /^(?:[48][1-9A-HJ-NP-Za-km-z]{94}|4[1-9A-HJ-NP-Za
 
 /**
  * An id of an exchange, such as 3a2360771439a3 at ChangeNOW or pch7l7kd1v2mzh1 at SimpleSwap, whose rate ids hold "_"
- * as well, or the deposit address of a swap at 1Click, 0x and up to 64 hex digits, which is how 1Click names a swap.
+ * as well, or the deposit address of a swap at 1Click, which is how 1Click names a swap: 0x and up to 64 hex digits on
+ * Starknet, or 35 characters of base58 on Zcash.
  * A created exchange with an id of another form is refused before the app gets a token for it (R-08 of the scan of
  * 12 Oct 2026), so that a swap the app holds can always be read.
  */
@@ -398,6 +400,14 @@ const ORIGIN_ADDRESSES: Record<
     isDeposit: isStarknetAddress,
     depositWords: "a Starknet address",
     same: sameStarknetAddress,
+  },
+  // The exchangers take and pay ZEC at transparent addresses alone; a shielded one would take no refund.
+  zec: {
+    isRefund: isZcashTransparentAddress,
+    refundWords: "a transparent Zcash address: 35 characters that start with t1 or t3",
+    isDeposit: isZcashTransparentAddress,
+    depositWords: "a transparent Zcash address",
+    same: sameText,
   },
 };
 

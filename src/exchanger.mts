@@ -1,6 +1,6 @@
 // What the relay needs from an exchanger, in one shape for all of them: ChangeNOW serves receive and pay, from 12 Oct
 // 2026 SimpleSwap serves pay as a second provider of the web app, and from 13 Oct 2026 the 1Click API of NEAR Intents
-// serves pay from Starknet. Pay takes a coin of a chain of origin, XMR on Monero or STRK on Starknet, into a coin on
+// serves pay from Starknet and Zcash. Pay takes a coin of a chain of origin, XMR, STRK, or ZEC, into a coin on
 // Robinhood Chain; the server checks every created exchange against its request with the names that each exchanger
 // gives.
 import type { Json } from "./json.mts";
@@ -10,16 +10,19 @@ export type ChainAsset = "eth" | "usdg";
 
 export const CHAIN_ASSET_NAMES: readonly ChainAsset[] = ["eth", "usdg"];
 
-/** The coins that pay takes in, in the names of the relay: XMR on Monero, and STRK on Starknet from 13 Oct 2026. */
-export type FromAsset = "xmr" | "strk";
+/**
+ * The coins that pay takes in, in the names of the relay: XMR on Monero, and from 13 Oct 2026 STRK on Starknet and
+ * ZEC on Zcash (at transparent addresses).
+ */
+export type FromAsset = "xmr" | "strk" | "zec";
 
-export const FROM_ASSET_NAMES: readonly FromAsset[] = ["xmr", "strk"];
+export const FROM_ASSET_NAMES: readonly FromAsset[] = ["xmr", "strk", "zec"];
 
 /** The coins of origin as the app and the user name them. */
-export const FROM_ASSET_LABELS: Record<FromAsset, string> = { xmr: "XMR", strk: "STRK" };
+export const FROM_ASSET_LABELS: Record<FromAsset, string> = { xmr: "XMR", strk: "STRK", zec: "ZEC" };
 
 /** The decimals of each coin of origin: an amount with more would be a number the chain cannot hold (R-21). */
-export const FROM_ASSET_DECIMALS: Record<FromAsset, number> = { xmr: 12, strk: 18 };
+export const FROM_ASSET_DECIMALS: Record<FromAsset, number> = { xmr: 12, strk: 18, zec: 8 };
 
 /** The rates of pay that the user chooses from. */
 export type PayRate = "fixed" | "floating";

@@ -24,7 +24,7 @@ const scanner = sources.length === 0 ? null : sources.length === 1 ? sources[0] 
 const relay = createRelay({
   exchanger: new ChangeNow(config.changenowApiKey),
   simpleswap: config.simpleswapApiKey === null ? null : new SimpleSwap(config.simpleswapApiKey),
-  // 1Click serves the relay with or without a partner key, so the exchanger of Starknet is always there.
+  // 1Click serves the relay with or without a partner key, so the exchanger of Starknet and Zcash is always there.
   oneclick: new OneClick(config.oneclickApiKey),
   scanner,
   tokens: new SwapTokens(config.swapTokenKey),

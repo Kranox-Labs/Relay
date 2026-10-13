@@ -12,6 +12,8 @@
 // "Out of min amount" with the range. From 13 Oct 2026 pay also takes STRK: CHECKED 13 Oct 2026 with the key of
 // Kranox, Starknet is the network "strk" (the network "starknet" answers "Currency strk is not supported"), and STRK
 // into USDG on Robinhood Chain ranges from 18.88 STRK at the floating rate and from 110.06 to 9142.31 at the fixed one.
+// ZEC is "zec" on the network "zec": into USDG from 0.0234 ZEC at the floating rate and from 0.0183 to 0.66 at the
+// fixed one, 1 ZEC at 1192.47 USDG with a deposit fee of 0.01 ZEC (CHECKED 13 Oct 2026, the same key).
 import { CHANGENOW_BASE_URL, MIN_AMOUNT_CACHE_MS, UPSTREAM_CALLS_PER_SECOND, UPSTREAM_TIMEOUT_MS } from "./config.mts";
 import {
   FROM_ASSET_NAMES,
@@ -42,10 +44,11 @@ export const CHAIN_ASSETS: Record<ChainAsset, Side> = {
   usdg: { currency: "usdg", network: "hood" },
 };
 
-/** The coins of origin of pay, with their names in v2 of the API: XMR on Monero, and STRK on Starknet. */
+/** The coins of origin of pay, with their names in v2 of the API: XMR on Monero, STRK on Starknet, and ZEC on Zcash. */
 export const FROM_SIDES: Record<FromAsset, Side> = {
   xmr: { currency: "xmr", network: "xmr" },
   strk: { currency: "strk", network: "strk" },
+  zec: { currency: "zec", network: "zec" },
 };
 
 const XMR: Side = FROM_SIDES.xmr;

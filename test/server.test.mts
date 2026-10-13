@@ -36,6 +36,11 @@ const CHAIN_DEPOSIT = "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984";
 const STRK_REFUND = "0x04a3f9c1b2e7d8a5c6f0e1d2c3b4a5968778695a4b3c2d1e0f1a2b3c4d5e6f70";
 const STRK_DEPOSIT = "0x01d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2";
 const STRK_ASSET = "nep141:starknet.omft.near";
+
+// A transparent refund address of Zcash and a transparent deposit address of a swap of ZEC, made for the tests.
+const ZEC_REFUND = "t1URu8q83ibd8sgDoW3VnJoPjUusRz97h8J";
+const ZEC_DEPOSIT = "t3S5pQGfcc3VC7ZyrC59bQwrnHco6q5Jzck";
+const ZEC_ASSET = "nep141:zec.omft.near";
 const HOOD_ASSETS: Record<ChainAsset, string> = {
   eth: "nep141:hood.omft.near",
   usdg: "nep141:hood-0x5fc5360d0400a0fd4f2af552add042d716f1d168.omft.near",
@@ -61,7 +66,7 @@ const STATUS_REFUSALS: Record<string, [number, string]> = {
 
 const fake: Exchanger = {
   name: "ChangeNOW",
-  origins: ["xmr", "strk"],
+  origins: ["xmr", "strk", "zec"],
   rates: ["fixed", "floating"],
   payNames(from: FromAsset, asset: ChainAsset, rate: PayRate) {
     return {
@@ -161,7 +166,7 @@ const fake: Exchanger = {
     // another amount of XMR, another flow, and another refund address. For STRK, 66 stands for a deposit address
     // that is not one of Starknet, and 55 for a refund address of another account; the refund address comes back
     // without its leading zero, as the same account.
-    const deposit = from === "strk" ? STRK_DEPOSIT : XMR_DEPOSIT;
+    const deposit = from === "strk" ? STRK_DEPOSIT : from === "zec" ? ZEC_DEPOSIT : XMR_DEPOSIT;
     const otherDeposit = from === "strk" ? XMR_DEPOSIT : "0xnotmonero";
     const recordedRefund = from === "strk" ? `0x${refundAddress.slice(3)}` : refundAddress;
     return {
@@ -204,7 +209,7 @@ const fake: Exchanger = {
 const simpleCalls: unknown[][] = [];
 const fakeSimple: PayExchanger = {
   name: "SimpleSwap",
-  origins: ["xmr"],
+  origins: ["xmr", "zec"],
   rates: ["fixed", "floating"],
   async ready() {
     simpleCalls.push(["ready"]);
@@ -245,11 +250,11 @@ const fakeSimple: PayExchanger = {
       id: xmrAmount === "0.44" ? "bad id!" : "pch7l7kd1v2mzh1",
       fromAmount: Number(xmrAmount),
       toAmount: 47.953709,
-      payinAddress: XMR_DEPOSIT,
+      payinAddress: from === "zec" ? ZEC_DEPOSIT : XMR_DEPOSIT,
       payoutAddress: address,
       refundAddress,
-      fromCurrency: "xmr",
-      fromNetwork: "xmr",
+      fromCurrency: from,
+      fromNetwork: from,
       toCurrency: asset,
       toNetwork: "robinhood",
       flow: rate,
@@ -273,19 +278,19 @@ const fakeSimple: PayExchanger = {
   },
 };
 
-// The exchanger of Starknet in the test: the 1Click API of NEAR Intents, which takes STRK at a floating rate alone,
+// The exchanger of Starknet and Zcash in the test: the 1Click API of NEAR Intents, which takes STRK and ZEC at a floating rate alone,
 // names a swap by its deposit address, and names the coins by their asset ids.
 const oneCalls: unknown[][] = [];
 const fakeOneClick: PayExchanger = {
   name: "NEAR Intents",
-  origins: ["strk"],
+  origins: ["strk", "zec"],
   rates: ["floating"],
   async ready() {
     oneCalls.push(["ready"]);
   },
   payNames(from: FromAsset, asset: ChainAsset) {
     return {
-      from: { currency: from === "strk" ? STRK_ASSET : from, network: "starknet" },
+      from: from === "zec" ? { currency: ZEC_ASSET, network: "zec" } : { currency: STRK_ASSET, network: "starknet" },
       to: { currency: HOOD_ASSETS[asset], network: "hood" },
       flow: "EXACT_INPUT",
     };
@@ -319,14 +324,15 @@ const fakeOneClick: PayExchanger = {
     oneCalls.push(["createPay", from, asset, rate, fromAmount, address, refundAddress, rateId]);
     // Four amounts stand for faults of 1Click: a deposit address that is not one of Starknet, another recipient,
     // another coin on Robinhood Chain, and another refund address.
+    const deposit = from === "zec" ? ZEC_DEPOSIT : STRK_DEPOSIT;
     return {
-      id: STRK_DEPOSIT,
+      id: deposit,
       fromAmount: Number(fromAmount),
       toAmount: 86.131039,
-      payinAddress: fromAmount === "66" ? XMR_DEPOSIT : STRK_DEPOSIT,
+      payinAddress: fromAmount === "66" ? XMR_DEPOSIT : deposit,
       payoutAddress: fromAmount === "77" ? REFUND_ADDRESS.toLowerCase() : address.toLowerCase(),
       refundAddress: fromAmount === "55" ? STRK_DEPOSIT : refundAddress,
-      fromCurrency: STRK_ASSET,
+      fromCurrency: from === "zec" ? ZEC_ASSET : STRK_ASSET,
       fromNetwork: null,
       toCurrency: fromAmount === "99" ? HOOD_ASSETS[asset === "usdg" ? "eth" : "usdg"] : HOOD_ASSETS[asset],
       toNetwork: null,
@@ -1477,4 +1483,124 @@ test("tells the coin of origin apart in the key of a creation", async () => {
   );
   assert.equal(other, 422, "another coin of origin is another request");
   assert.equal(calls.filter((call) => call[0] === "createPay").length, 1);
+});
+
+test("serves ZEC through all three exchangers, at transparent addresses alone", async () => {
+  calls.length = 0;
+  simpleCalls.length = 0;
+  oneCalls.length = 0;
+  for (const provider of ["changenow", "simpleswap", "oneclick"] as const) {
+    const [status, body] = await json(`/v1/pay/range?provider=${provider}&from=zec&asset=usdg&rate=floating`);
+    assert.equal(status, 200, provider);
+    assert.equal(body.from, "zec");
+    assert.equal("minXmr" in body, false);
+  }
+  const [simple, simpleBody] = await json(
+    "/v1/pay/swaps",
+    post({
+      provider: "simpleswap",
+      from: "zec",
+      asset: "usdg",
+      rate: "floating",
+      fromAmount: "0.1",
+      address: RECIPIENT,
+      refundAddress: ZEC_REFUND,
+    }),
+  );
+  assert.equal(simple, 201);
+  assert.equal(simpleBody.depositAddress, ZEC_DEPOSIT);
+  assert.equal(simpleBody.refundAddress, ZEC_REFUND);
+  const [one, oneBody] = await json(
+    "/v1/pay/swaps",
+    post({
+      provider: "oneclick",
+      from: "zec",
+      asset: "eth",
+      rate: "floating",
+      fromAmount: "0.005",
+      address: RECIPIENT,
+      refundAddress: ZEC_REFUND,
+    }),
+  );
+  assert.equal(one, 201);
+  assert.equal(oneBody.id, ZEC_DEPOSIT, "the deposit address names the swap at 1Click");
+  assert.equal(oneBody.readToken, tokens.issue(ZEC_DEPOSIT, "oneclick"));
+  const [read] = await json(`/v1/swaps/${ZEC_DEPOSIT}?provider=oneclick`, {
+    headers: { "kranox-swap-token": tokens.issue(ZEC_DEPOSIT, "oneclick") },
+  });
+  assert.equal(read, 200);
+  // A refund can only go to a transparent address: a shielded one, a unified one, one with a wrong checksum, and the
+  // addresses of the other chains are refused before any call.
+  const changed = `${ZEC_REFUND.slice(0, 20)}${ZEC_REFUND[20] === "a" ? "b" : "a"}${ZEC_REFUND.slice(21)}`;
+  for (const refundAddress of [
+    "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8f3g2d4kv4v9q0jfgcm3vhk3wm6ajqmp8",
+    "u1l8xunezsvhq8fgzfl7404m450nwnd76zshscn6nfys7vyz2ywyh4cc5daaq0c7q2su5lqfh23sp7fkf3kt27ve5948mzpjkmh6xfyau7zh33ac",
+    changed,
+    MAINNET_SUBADDRESS,
+    STRK_REFUND,
+  ]) {
+    const [status, body] = await json(
+      "/v1/pay/swaps",
+      post({
+        provider: "changenow",
+        from: "zec",
+        asset: "usdg",
+        rate: "floating",
+        fromAmount: "0.1",
+        address: RECIPIENT,
+        refundAddress,
+      }),
+    );
+    assert.equal(status, 400, refundAddress);
+    assert.match(String(body.error), /transparent Zcash address/);
+  }
+  const [tooFine, tooFineBody] = await json("/v1/pay/quote?from=zec&asset=usdg&rate=floating&fromAmount=0.123456789");
+  assert.equal(tooFine, 400);
+  assert.match(String(tooFineBody.error), /at most 8 decimals/);
+  // ZEC through ChangeNOW: a swap as asked, and none whose deposit address is not transparent or whose refund address
+  // differs (R-32).
+  calls.length = 0;
+  const [viaChangenow, viaChangenowBody] = await json(
+    "/v1/pay/swaps",
+    post({
+      provider: "changenow",
+      from: "zec",
+      asset: "usdg",
+      rate: "fixed",
+      fromAmount: "0.1",
+      address: RECIPIENT,
+      refundAddress: ZEC_REFUND,
+      rateId: RATE_ID,
+    }),
+  );
+  assert.equal(viaChangenow, 201);
+  assert.equal(viaChangenowBody.depositAddress, ZEC_DEPOSIT);
+  for (const [fromAmount, reason] of [
+    ["66", "not a transparent Zcash address"],
+    ["55", "another refund address"],
+  ]) {
+    const [failed, failedBody] = await json(
+      "/v1/pay/swaps",
+      post({
+        provider: "changenow",
+        from: "zec",
+        asset: "usdg",
+        rate: "floating",
+        fromAmount,
+        address: RECIPIENT,
+        refundAddress: ZEC_REFUND,
+      }),
+    );
+    assert.equal(failed, 502, fromAmount);
+    assert.match(String(failedBody.error), new RegExp(reason), fromAmount);
+    assert.equal(failedBody.exchangeId, "9f4e2c71b03ad1", fromAmount);
+  }
+  assert.equal(calls.filter((call) => call[0] === "createPay").length, 3);
+  const [strkAtSimple] = await json("/v1/pay/range?provider=simpleswap&from=strk&asset=usdg&rate=floating");
+  assert.equal(strkAtSimple, 422, "SimpleSwap still takes no STRK");
+  assert.deepEqual(oneCalls, [
+    ["payRange", "zec", "usdg", "floating"],
+    ["createPay", "zec", "eth", "floating", "0.005", RECIPIENT, ZEC_REFUND, null],
+    ["status", ZEC_DEPOSIT],
+  ]);
 });

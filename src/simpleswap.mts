@@ -4,9 +4,13 @@
 // "usdg" on the network "robinhood", at a fixed and at a floating rate. /v3/ranges gives the range in XMR as text
 // (the top null for a floating rate), /v3/estimates the amount with the id and the time of a fixed rate, and an
 // amount outside the range answers 422 "Amount does not fall within the range. Min: …, max: …". An exchange has the
-// deposit address in addressFrom, the amount of XMR in amountFrom, the coin in expectedAmount at first and amountTo
-// at the end, and the hashes in txFrom and txTo. The key allows 50 calls in a window (the headers x-ratelimit-limit
-// and x-ratelimit-reset, about a minute apart), so the relay keeps the ranges for a while and stays under it.
+// deposit address in addressFrom, the amount of the coin of origin in amountFrom and again in expectedAmount (the
+// deposit that SimpleSwap expects), the coin that arrives in amountTo, an estimate while the exchange waits and the
+// fact at the end, and the hashes in txFrom and txTo (CHECKED 13 Oct 2026 on the first real exchange, 0.1 ZEC at a
+// floating rate: amountFrom "0.1", expectedAmount "0.1", amountTo "107.647781", status "waiting"; until then the
+// relay read expectedAmount as the coin that arrives, R-38 of the scan of that day). The key allows 50 calls in a
+// window (the headers x-ratelimit-limit and x-ratelimit-reset, about a minute apart), so the relay keeps the ranges
+// for a while and stays under it.
 import {
   SIMPLESWAP_BASE_URL,
   SIMPLESWAP_CALLS_PER_MINUTE,
@@ -44,8 +48,12 @@ const CHAIN_SIDES: Record<ChainAsset, Side> = {
 
 const XMR: Side = { currency: "xmr", network: "xmr" };
 
-/** The coins of origin that the relay sends through SimpleSwap: XMR alone (NOT CHECKED: whether v3 lists STRK). */
-const FROM_SIDES: Partial<Record<FromAsset, Side>> = { xmr: XMR };
+/**
+ * The coins of origin that the relay sends through SimpleSwap: XMR, and ZEC on the network "zec" (CHECKED 13 Oct
+ * 2026 with the key: into USDG on Robinhood Chain from 0.0238 ZEC at the floating rate and from 0.0187 to 0.66 at the
+ * fixed one). NOT CHECKED: whether v3 lists STRK.
+ */
+const FROM_SIDES: Partial<Record<FromAsset, Side>> = { xmr: XMR, zec: { currency: "zec", network: "zec" } };
 
 /** The side of origin of [from], or a refusal for a coin the relay does not send through SimpleSwap. */
 function fromSide(from: FromAsset): Side {
@@ -131,7 +139,8 @@ function outOfRange(error: UpstreamError, fromAmount: string): PayOutOfRange | n
 
 export class SimpleSwap implements PayExchanger {
   readonly name = SIMPLESWAP_NAME;
-  readonly origins: readonly FromAsset[] = ["xmr"];
+  // The coins of origin come from the one table of their sides, so that none can be left out of the other (R-34).
+  readonly origins: readonly FromAsset[] = Object.keys(FROM_SIDES) as FromAsset[];
   readonly rates: readonly PayRate[] = PAY_RATE_NAMES;
   readonly #apiKey: string;
   readonly #fetch: typeof fetch;
@@ -147,9 +156,12 @@ export class SimpleSwap implements PayExchanger {
     this.#limiter = new CallLimiter(SIMPLESWAP_CALLS_PER_MINUTE, now, MS_PER_MINUTE);
   }
 
-  /** One range, which the cache keeps rare, shows that SimpleSwap takes the key of the relay (R-11 of the scan of 12 Oct 2026). */
+  /**
+   * One range of each coin of origin, which the cache keeps rare, shows that SimpleSwap takes the key of the relay
+   * and still lists the coin (R-11 of the scan of 12 Oct 2026, R-34 of 13 Oct 2026).
+   */
   async ready(): Promise<void> {
-    await this.payRange("xmr", "eth", "fixed");
+    for (const from of this.origins) await this.payRange(from, "eth", "fixed");
   }
 
   async payRange(from: FromAsset, asset: ChainAsset, rate: PayRate): Promise<PayRange> {
@@ -229,8 +241,9 @@ export class SimpleSwap implements PayExchanger {
     };
     if (rateId !== null) body.rateId = rateId;
     const data = await this.#call("/v3/exchanges", { method: "POST", body: JSON.stringify(body) });
-    // The coin that arrives is expectedAmount while the exchange runs, and amountTo once it is done.
-    const toAmount = amountOrNull(data.expectedAmount) ?? amountOrNull(data.amountTo);
+    // The coin that arrives is amountTo, an estimate while the exchange runs and the fact once it is done; expectedAmount
+    // is the deposit that SimpleSwap expects, in the coin of origin (R-38).
+    const toAmount = amountOrNull(data.amountTo);
     if (toAmount === null) throw new GatewayError(502, `${SIMPLESWAP_NAME} answered without the amount that arrives.`);
     return {
       id: requireString(data, "id"),
@@ -259,10 +272,12 @@ export class SimpleSwap implements PayExchanger {
     const status = requireString(data, "status");
     // A state that the app does not know would show as a swap in an unknown state; the relay says so instead.
     if (!KNOWN_STATES.has(status)) throw new GatewayError(502, `${SIMPLESWAP_NAME} answered with an unknown state.`);
+    // One field, amountTo, carries the coin that arrives: an estimate until the exchange is done, then the fact (R-38).
+    const amountTo = amountOrNull(data.amountTo);
     return {
       status,
-      amountTo: amountOrNull(data.amountTo),
-      expectedAmountTo: amountOrNull(data.expectedAmount),
+      amountTo: status === "finished" ? amountTo : null,
+      expectedAmountTo: amountTo,
       payinHash: stringOrNull(data.txFrom),
       payoutHash: stringOrNull(data.txTo),
       refundAddress: stringOrNull(data.userRefundAddress),
