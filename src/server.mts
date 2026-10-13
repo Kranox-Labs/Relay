@@ -1,13 +1,16 @@
-// The HTTP interface of the relay for the app. It holds the API key of ChangeNOW, so that the key never sits in the
+// The HTTP interface of the relay for the app. It holds the API keys of the exchangers, so that no key ever sits in the
 // app, and it forwards only the calls of the bridge, with checked input: receive, a coin on Robinhood Chain into XMR,
-// and pay, an amount of XMR into a coin for an address on Robinhood Chain at a fixed rate. It also holds the key of
-// Blockscout for the privacy scan of an address on Robinhood Chain, so that the explorer sees the relay and not the user.
-// It writes no log of a request: no amount, no address, and no id leaves it except toward ChangeNOW or Blockscout and
-// back to the app.
+// and pay, an amount of a coin of origin, XMR on Monero or STRK on Starknet (from 13 Oct 2026), into a coin for an
+// address on Robinhood Chain at a fixed or a floating rate. It also holds the key of Blockscout for the privacy scan
+// of an address on Robinhood Chain, so that the explorer sees the relay and not the user. It writes no log of a
+// request: no amount, no address, and no id leaves it except toward an exchanger or Blockscout and back to the app.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { EVM_ADDRESS_PATTERN, type ChainScanner } from "./scan.mts";
 import {
   CHAIN_ASSET_NAMES,
+  FROM_ASSET_DECIMALS,
+  FROM_ASSET_LABELS,
+  FROM_ASSET_NAMES,
   GatewayError,
   PAY_RATE_NAMES,
   PROVIDER_IDS,
@@ -15,11 +18,13 @@ import {
   type ChainAsset,
   type CreatedExchange,
   type Exchanger,
+  type FromAsset,
   type PairNames,
   type PayExchanger,
   type PayRate,
   type ProviderId,
 } from "./exchanger.mts";
+import { isStarknetAddress, sameStarknetAddress } from "./starknet.mts";
 import {
   AMOUNT_MATCH_TOLERANCE,
   MAX_BODY_BYTES,
@@ -51,6 +56,8 @@ export interface RelayParts {
   exchanger: Exchanger;
   /** SimpleSwap, the second exchanger of pay, or null when the relay has no key for it. */
   simpleswap: PayExchanger | null;
+  /** The 1Click API of NEAR Intents, the exchanger of Starknet, or null in a relay without it (the tests). */
+  oneclick: PayExchanger | null;
   scanner: ChainScanner | null;
   tokens: SwapTokens;
   creations: CreationKeys;
@@ -73,10 +80,11 @@ const MONERO_DEPOSIT_PATTERN = /^(?:[48][1-9A-HJ-NP-Za-km-z]{94}|4[1-9A-HJ-NP-Za
 
 /**
  * An id of an exchange, such as 3a2360771439a3 at ChangeNOW or pch7l7kd1v2mzh1 at SimpleSwap, whose rate ids hold "_"
- * as well. A created exchange with an id of another form is refused before the app gets a token for it (R-08 of the
- * scan of 12 Oct 2026), so that a swap the app holds can always be read.
+ * as well, or the deposit address of a swap at 1Click, 0x and up to 64 hex digits, which is how 1Click names a swap.
+ * A created exchange with an id of another form is refused before the app gets a token for it (R-08 of the scan of
+ * 12 Oct 2026), so that a swap the app holds can always be read.
  */
-const EXCHANGE_ID_PATTERN = /^[0-9a-zA-Z_-]{6,64}$/;
+const EXCHANGE_ID_PATTERN = /^[0-9a-zA-Z_-]{6,128}$/;
 
 /** The id of a fixed rate at ChangeNOW: base64 text, a few hundred characters long. */
 const RATE_ID_PATTERN = /^[A-Za-z0-9+/=_-]{8,1024}$/;
@@ -86,7 +94,7 @@ const SWAP_PATH = /^\/v1\/swaps\/([^/]+)$/;
 /** The only type of body that the relay reads. A browser cannot send it to another site without asking first. */
 const JSON_MEDIA_TYPE = "application/json";
 
-/** The answers of ChangeNOW that refuse the request itself; their text tells the user what to change. */
+/** The answers of an exchanger that refuse the request itself; their text tells the user what to change. */
 const REFUSAL_STATUSES = new Set([400, 404, 422]);
 
 /**
@@ -202,8 +210,49 @@ function readProvider(parts: RelayParts, value: unknown): { id: ProviderId; exch
   const id = PROVIDER_IDS.find((name) => name === value);
   if (id === undefined) throw new RequestError(400, `The provider must be one of: ${PROVIDER_IDS.join(", ")}.`);
   if (id === "changenow") return { id, exchanger: parts.exchanger };
+  if (id === "oneclick") {
+    if (parts.oneclick === null) throw new RequestError(503, "The relay has no NEAR Intents yet.");
+    return { id, exchanger: parts.oneclick };
+  }
   if (parts.simpleswap === null) throw new RequestError(503, "The relay has no key for SimpleSwap yet.");
   return { id, exchanger: parts.simpleswap };
+}
+
+/**
+ * The coin of origin of a payment, or XMR when the request names none, as the Mac app sends it. An empty or null one
+ * is a fault of a client, not a choice.
+ */
+function readFrom(value: unknown): FromAsset {
+  if (value === undefined) return "xmr";
+  const from = FROM_ASSET_NAMES.find((name) => name === value);
+  if (from !== undefined) return from;
+  throw new RequestError(400, `The coin of origin (from) must be one of: ${FROM_ASSET_NAMES.join(", ")}.`);
+}
+
+/**
+ * The coin of origin of a quote or a creation: the one named, or XMR when the amount comes as xmrAmount, as the Mac
+ * app writes it, and nothing else: an amount under the name of every coin without a coin names none (R-19 of the
+ * scan of 13 Oct 2026).
+ */
+function readFromOfAmount(from: unknown, xmrAmount: unknown): FromAsset {
+  if (from === undefined && (xmrAmount === undefined || xmrAmount === null)) {
+    throw new RequestError(400, `The coin of origin (from) must be one of: ${FROM_ASSET_NAMES.join(", ")}.`);
+  }
+  return readFrom(from);
+}
+
+/** How many decimals [amount] writes after its point. */
+function decimalsOf(amount: string): number {
+  const point = amount.indexOf(".");
+  return point < 0 ? 0 : amount.length - point - 1;
+}
+
+/** Refuses a pair that [exchanger] does not serve before any call reaches it: a coin of origin or a rate not its own. */
+function checkServes(exchanger: PayExchanger, from: FromAsset, rate: PayRate): void {
+  if (!exchanger.origins.includes(from)) {
+    throw new RequestError(422, `${exchanger.name} does not take ${FROM_ASSET_LABELS[from]}.`);
+  }
+  if (!exchanger.rates.includes(rate)) throw new RequestError(422, `${exchanger.name} has no ${rate} rate.`);
 }
 
 function readAmount(value: unknown): string {
@@ -211,6 +260,44 @@ function readAmount(value: unknown): string {
     throw new RequestError(400, "The amount must be a number above zero, with a point for decimals.");
   }
   return value;
+}
+
+/**
+ * The amount of the coin of origin of a request: fromAmount, or xmrAmount as the Mac app writes an amount of XMR. An
+ * amount of another coin under the name of XMR is a fault of a client, and so are two amounts that differ.
+ */
+function readFromAmount(from: FromAsset, fromAmount: unknown, xmrAmount: unknown): string {
+  let amount: string;
+  if (xmrAmount === undefined || xmrAmount === null) {
+    amount = readAmount(fromAmount);
+  } else {
+    if (from !== "xmr") {
+      throw new RequestError(400, "xmrAmount is an amount of XMR; an amount of another coin goes in fromAmount.");
+    }
+    if (fromAmount !== undefined && fromAmount !== null && fromAmount !== xmrAmount) {
+      throw new RequestError(400, "fromAmount and xmrAmount differ; send one of them.");
+    }
+    amount = readAmount(xmrAmount);
+  }
+  // A coin holds only so many decimals: more would be a number the chain cannot carry (R-21).
+  const decimals = FROM_ASSET_DECIMALS[from];
+  if (decimalsOf(amount) > decimals) {
+    throw new RequestError(400, `An amount of ${FROM_ASSET_LABELS[from]} has at most ${decimals} decimals.`);
+  }
+  return amount;
+}
+
+/**
+ * An answer of pay with, for XMR, the names of its amounts that the Mac app reads (xmrAmount, minXmr, maxXmr) beside
+ * the names that hold for every coin of origin (fromAmount, minFrom, maxFrom).
+ */
+function withXmrNames(from: FromAsset, body: Record<string, unknown>): Record<string, unknown> {
+  if (from !== "xmr") return body;
+  const names: Record<string, unknown> = {};
+  if ("fromAmount" in body) names.xmrAmount = body.fromAmount;
+  if ("minFrom" in body) names.minXmr = body.minFrom;
+  if ("maxFrom" in body) names.maxXmr = body.maxFrom;
+  return { ...body, ...names };
 }
 
 /**
@@ -258,8 +345,8 @@ function pairMatches(created: CreatedExchange, names: PairNames): boolean {
 }
 
 /**
- * Whether ChangeNOW recorded the refund address of the request: the same one, compared by [same], or none when the
- * request named none.
+ * Whether the exchanger recorded the refund address of the request: the same one, compared by [same], or none when
+ * the request named none.
  */
 function refundMatches(
   created: CreatedExchange,
@@ -273,7 +360,7 @@ function refundMatches(
   return requested === null ? recorded === null : recorded !== null && same(recorded, requested);
 }
 
-/** The refund address that ChangeNOW recorded for a swap, which the relay hands the app to compare (wallet O-003). */
+/** The refund address that the exchanger recorded for a swap, which the relay hands the app to compare (wallet O-003). */
 function recordedRefund(created: CreatedExchange): string | null {
   return created.refundAddress || null;
 }
@@ -282,6 +369,37 @@ const sameText = (a: string, b: string): boolean => a === b;
 
 /** Two addresses on Robinhood Chain: the same in any case of their hex digits. */
 const sameEvmAddress = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+
+/**
+ * The addresses of each chain of origin: whether a text is one that a refund can go to, with the words of a refusal;
+ * whether a text is one that a deposit can go to; and whether two name the same account. The app checks the checksum
+ * of a Monero address itself; the relay keeps text of another shape away from the exchangers.
+ */
+const ORIGIN_ADDRESSES: Record<
+  FromAsset,
+  {
+    isRefund: (text: string) => boolean;
+    refundWords: string;
+    isDeposit: (text: string) => boolean;
+    depositWords: string;
+    same: (a: string, b: string) => boolean;
+  }
+> = {
+  xmr: {
+    isRefund: (text) => MONERO_ADDRESS_PATTERN.test(text),
+    refundWords: "a Monero mainnet address",
+    isDeposit: (text) => MONERO_DEPOSIT_PATTERN.test(text),
+    depositWords: "a Monero mainnet address",
+    same: sameText,
+  },
+  strk: {
+    isRefund: isStarknetAddress,
+    refundWords: "a Starknet account address: 0x and up to 64 hex digits, not an address of an EVM chain",
+    isDeposit: isStarknetAddress,
+    depositWords: "a Starknet address",
+    same: sameStarknetAddress,
+  },
+};
 
 /** Why an exchange of receive differs from its request, or null when it matches. */
 function receiveMismatch(
@@ -310,20 +428,26 @@ function receiveMismatch(
 function payMismatch(
   exchanger: PayExchanger,
   created: CreatedExchange,
+  from: FromAsset,
   asset: ChainAsset,
   rate: PayRate,
-  xmrAmount: string,
+  fromAmount: string,
   address: string,
   refundAddress: string,
 ): string | null {
   const name = exchanger.name;
-  if (!MONERO_DEPOSIT_PATTERN.test(created.payinAddress)) {
-    return `${name} gave a deposit address that is not a Monero mainnet address.`;
+  const origin = ORIGIN_ADDRESSES[from];
+  if (!origin.isDeposit(created.payinAddress)) {
+    return `${name} gave a deposit address that is not ${origin.depositWords}.`;
   }
   if (!sameEvmAddress(created.payoutAddress, address)) return `${name} made the exchange for another recipient.`;
-  if (!refundMatches(created, refundAddress, sameText)) return `${name} made the exchange with another refund address.`;
-  if (!amountsMatch(xmrAmount, created.fromAmount)) return `${name} made the exchange for another amount of XMR.`;
-  if (!pairMatches(created, exchanger.payNames(asset, rate)))
+  if (!refundMatches(created, refundAddress, origin.same)) {
+    return `${name} made the exchange with another refund address.`;
+  }
+  if (!amountsMatch(fromAmount, created.fromAmount)) {
+    return `${name} made the exchange for another amount of ${FROM_ASSET_LABELS[from]}.`;
+  }
+  if (!pairMatches(created, exchanger.payNames(from, asset, rate)))
     return `${name} made the exchange for another pair of coins.`;
   return null;
 }
@@ -428,25 +552,31 @@ async function createSwap(parts: RelayParts, request: IncomingMessage, raw: Buff
 
 async function payRange(parts: RelayParts, url: URL): Promise<unknown> {
   const { id: provider, exchanger } = readProvider(parts, url.searchParams.get("provider") ?? undefined);
+  const from = readFrom(url.searchParams.get("from") ?? undefined);
   const asset = readAsset(url.searchParams.get("asset"));
   const rate = readRate(url.searchParams.get("rate"));
-  const range = await exchanger.payRange(asset, rate);
-  return { provider, asset, rate, minXmr: range.minXmr, maxXmr: range.maxXmr };
+  checkServes(exchanger, from, rate);
+  const range = await exchanger.payRange(from, asset, rate);
+  return withXmrNames(from, { provider, from, asset, rate, minFrom: range.minFrom, maxFrom: range.maxFrom });
 }
 
 async function payQuote(parts: RelayParts, url: URL): Promise<unknown> {
   const { id: provider, exchanger } = readProvider(parts, url.searchParams.get("provider") ?? undefined);
+  const xmrAmountParam = url.searchParams.get("xmrAmount") ?? undefined;
+  const from = readFromOfAmount(url.searchParams.get("from") ?? undefined, xmrAmountParam);
   const asset = readAsset(url.searchParams.get("asset"));
   const rate = readRate(url.searchParams.get("rate"));
-  const xmrAmount = readAmount(url.searchParams.get("xmrAmount"));
-  const estimate = await exchanger.payEstimate(asset, rate, xmrAmount);
-  // An amount outside the range of the rate gets no estimate; the app shows the range in XMR instead.
+  const fromAmount = readFromAmount(from, url.searchParams.get("fromAmount") ?? undefined, xmrAmountParam);
+  checkServes(exchanger, from, rate);
+  const estimate = await exchanger.payEstimate(from, asset, rate, fromAmount);
+  // An amount outside the range of the rate gets no estimate; the app shows the range of the coin of origin instead.
   if ("limit" in estimate) {
-    return {
+    return withXmrNames(from, {
       provider,
+      from,
       asset,
       rate,
-      xmrAmount,
+      fromAmount,
       amount: null,
       rateId: null,
       validUntil: null,
@@ -455,15 +585,16 @@ async function payQuote(parts: RelayParts, url: URL): Promise<unknown> {
       withdrawalFee: null,
       speedMinutes: null,
       limit: estimate.limit,
-      minXmr: estimate.minXmr,
-      maxXmr: estimate.maxXmr,
-    };
+      minFrom: estimate.minFrom,
+      maxFrom: estimate.maxFrom,
+    });
   }
-  return {
+  return withXmrNames(from, {
     provider,
+    from,
     asset,
     rate,
-    xmrAmount,
+    fromAmount,
     amount: estimate.amount,
     rateId: estimate.rateId,
     validUntil: estimate.validUntil,
@@ -472,9 +603,9 @@ async function payQuote(parts: RelayParts, url: URL): Promise<unknown> {
     withdrawalFee: estimate.withdrawalFee,
     speedMinutes: estimate.speedMinutes,
     limit: null,
-    minXmr: null,
-    maxXmr: null,
-  };
+    minFrom: null,
+    maxFrom: null,
+  });
 }
 
 async function createPay(parts: RelayParts, request: IncomingMessage, url: URL, raw: Buffer): Promise<unknown> {
@@ -484,15 +615,18 @@ async function createPay(parts: RelayParts, request: IncomingMessage, url: URL, 
   }
   const body = parseBody(raw);
   const { id: provider, exchanger } = readProvider(parts, body.provider);
+  const from = readFromOfAmount(body.from, body.xmrAmount);
   const asset = readAsset(body.asset);
   const rate = readRate(body.rate);
-  const xmrAmount = readAmount(body.xmrAmount);
+  const fromAmount = readFromAmount(from, body.fromAmount, body.xmrAmount);
+  checkServes(exchanger, from, rate);
   const address = body.address;
   if (typeof address !== "string" || !EVM_ADDRESS_PATTERN.test(address)) {
     throw new RequestError(400, "The address must be a Robinhood Chain address: 0x and 40 hex digits.");
   }
-  if (typeof body.refundAddress !== "string" || !MONERO_ADDRESS_PATTERN.test(body.refundAddress)) {
-    throw new RequestError(400, "The refund address must be a Monero mainnet address.");
+  const origin = ORIGIN_ADDRESSES[from];
+  if (typeof body.refundAddress !== "string" || !origin.isRefund(body.refundAddress)) {
+    throw new RequestError(400, `The refund address must be ${origin.refundWords}.`);
   }
   // A fixed rate needs the id of its rate; a floating rate has none.
   let rateId: string | null = null;
@@ -505,24 +639,31 @@ async function createPay(parts: RelayParts, request: IncomingMessage, url: URL, 
     throw new RequestError(400, "A floating rate takes no rate id.");
   }
   const refundAddress = body.refundAddress;
-  const fields = { route: "pay", provider, asset, rate, xmrAmount, address, refundAddress, rateId };
+  const fields = { route: "pay", provider, from, asset, rate, fromAmount, address, refundAddress, rateId };
   return parts.creations.run(header(request, CREATION_KEY_HEADER), fields, async () => {
-    const created = await exchanger.createPay(asset, rate, xmrAmount, address, refundAddress, rateId);
-    // The app sends XMR to the deposit address and trusts the recipient, so the relay passes on nothing else.
-    checkCreated(exchanger, created, payMismatch(exchanger, created, asset, rate, xmrAmount, address, refundAddress));
-    // The app compares the refund address that ChangeNOW recorded with the one that it sent (wallet O-003 of the second
-    // security review).
-    return {
+    const created = await exchanger.createPay(from, asset, rate, fromAmount, address, refundAddress, rateId);
+    // The app sends the coins to the deposit address and trusts the recipient, so the relay passes on nothing else.
+    checkCreated(
+      exchanger,
+      created,
+      payMismatch(exchanger, created, from, asset, rate, fromAmount, address, refundAddress),
+    );
+    // The app compares the refund address that the exchanger recorded with the one that it sent (wallet O-003 of the
+    // second security review).
+    return withXmrNames(from, {
       id: created.id,
       provider,
+      from,
       asset,
       amount: created.toAmount,
-      xmrAmount: created.fromAmount,
+      fromAmount: created.fromAmount,
       depositAddress: created.payinAddress,
       payoutAddress: created.payoutAddress,
       refundAddress: recordedRefund(created),
+      // The time to send, when the exchanger names one at the creation, so that the app shows it at once (R-25).
+      validUntil: created.validUntil,
       readToken: parts.tokens.issue(created.id, provider),
-    };
+    });
   });
 }
 
@@ -566,12 +707,14 @@ async function readSwap(parts: RelayParts, request: IncomingMessage, url: URL, i
 }
 
 /**
- * Answers whether the relay can use its keys: one call to ChangeNOW, which the cache of the minimum keeps rare, and,
- * with a key for SimpleSwap, one range of it, which its cache keeps rare too (R-11 of the scan of 12 Oct 2026).
+ * Answers whether the relay can use its keys: one call to ChangeNOW, which the cache of the minimum keeps rare, and
+ * one check of each other exchanger that has one, which their caches keep rare too (R-11 of the scan of 12 Oct 2026).
  */
 async function ready(parts: RelayParts): Promise<unknown> {
   await parts.exchanger.minAmount("eth");
-  if (parts.simpleswap !== null) await parts.simpleswap.payRange("eth", "fixed");
+  for (const exchanger of [parts.simpleswap, parts.oneclick]) {
+    if (exchanger?.ready !== undefined) await exchanger.ready();
+  }
   return { ok: true };
 }
 
@@ -609,7 +752,7 @@ function isControl(char: string): boolean {
   return code < 0x20 || code === 0x7f;
 }
 
-/** Text of ChangeNOW for the app: one line, without control characters, cut short. */
+/** Text of an exchanger for the app: one line, without control characters, cut short. */
 function forwarded(message: string): string {
   const line = Array.from(message, (char) => (isControl(char) ? " " : char))
     .join("")
@@ -619,9 +762,10 @@ function forwarded(message: string): string {
 }
 
 /**
- * What the app learns of an error answer of ChangeNOW. A refusal of the request, such as an amount below the minimum,
- * reaches it as a refusal with the text of ChangeNOW. A refused key, a spent budget of calls, and a failure of
- * ChangeNOW reach it with a fixed text of the relay, so that no message about the account of Kranox leaves the relay.
+ * What the app learns of an error answer of an exchanger. A refusal of the request, such as an amount below the
+ * minimum, reaches it as a refusal with the text of the exchanger. A refused key, a spent budget of calls, and a
+ * failure of the exchanger reach it with a fixed text of the relay, so that no message about the account of Kranox
+ * leaves the relay.
  */
 function upstreamAnswer(error: UpstreamError): [number, string] {
   if (REFUSAL_STATUSES.has(error.status)) return [422, forwarded(error.message)];

@@ -5,6 +5,7 @@ import { Blockscout } from "./blockscout.mts";
 import { ChangeNow } from "./changenow.mts";
 import { CREATION_KEY_ENTRIES, CREATION_KEY_MS, loadConfig } from "./config.mts";
 import { CreationKeys } from "./creations.mts";
+import { OneClick } from "./oneclick.mts";
 import { FallbackScanner } from "./scan.mts";
 import { createRelay } from "./server.mts";
 import { AnswerSigner } from "./signing.mts";
@@ -23,6 +24,8 @@ const scanner = sources.length === 0 ? null : sources.length === 1 ? sources[0] 
 const relay = createRelay({
   exchanger: new ChangeNow(config.changenowApiKey),
   simpleswap: config.simpleswapApiKey === null ? null : new SimpleSwap(config.simpleswapApiKey),
+  // 1Click serves the relay with or without a partner key, so the exchanger of Starknet is always there.
+  oneclick: new OneClick(config.oneclickApiKey),
   scanner,
   tokens: new SwapTokens(config.swapTokenKey),
   creations: new CreationKeys(CREATION_KEY_MS, CREATION_KEY_ENTRIES),

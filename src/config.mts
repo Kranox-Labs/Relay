@@ -1,6 +1,7 @@
 // The settings of the relay. This module is the only one that reads the environment; it checks every variable at
 // startup and stops with a clear error when one is missing. The API key is read from a file and is never printed.
 import { readFileSync } from "node:fs";
+import type { FromAsset } from "./exchanger.mts";
 
 export interface RelayConfig {
   host: string;
@@ -8,6 +9,11 @@ export interface RelayConfig {
   changenowApiKey: string;
   /** The key of SimpleSwap, the second exchanger of pay, or null when the relay has none: the app then has ChangeNOW alone. */
   simpleswapApiKey: string | null;
+  /**
+   * The partner key of the 1Click API of NEAR Intents, a JWT, or null when the relay has none: 1Click serves the relay
+   * without one, with 0.25% more on every swap and no confidential mode (CHECKED 13 Oct 2026, its documentation).
+   */
+  oneclickApiKey: string | null;
   /** The key of the PRO API of Blockscout for the scan of an address, or null when the relay has none. */
   blockscoutApiKey: string | null;
   /** The key of Alchemy for the scan of an address, or null when the relay has none. The relay prefers it. */
@@ -48,6 +54,60 @@ export const SIMPLESWAP_ESTIMATE_CACHE_MS = 10_000;
 
 /** The relay keeps at most this many quotes of SimpleSwap at once, and forgets them all when the list is full. */
 export const SIMPLESWAP_ESTIMATE_CACHE_ENTRIES = 200;
+
+/**
+ * The 1Click API of NEAR Intents, the exchanger of Starknet from 13 Oct 2026: a quote is one POST, dry for an
+ * estimate and real for a swap, and the state of a swap comes by its deposit address (CHECKED 13 Oct 2026, its OpenAPI
+ * file at /docs/v0/openapi.yaml).
+ */
+export const ONECLICK_BASE_URL = "https://1click.chaindefuser.com";
+
+/**
+ * The relay makes at most this many calls to 1Click in a second, for all users together, in three budgets: dry
+ * quotes, reads of a state, and real quotes with the token list, so that a flood of one kind never starves another
+ * (R-15 of the scan of 13 Oct 2026). NOT CHECKED: the budget of 1Click for a key or for none; a quote asks its
+ * market makers, so the relay keeps them few.
+ */
+export const ONECLICK_ESTIMATES_PER_SECOND = 2;
+export const ONECLICK_READS_PER_SECOND = 2;
+export const ONECLICK_CREATIONS_PER_SECOND = 2;
+
+/** The relay keeps a quote of 1Click for this long, for the same coins and amount, so that the pages spend one call. */
+export const ONECLICK_ESTIMATE_CACHE_MS = 10_000;
+
+/** The relay keeps at most this many quotes of 1Click at once, and forgets them all when the list is full. */
+export const ONECLICK_ESTIMATE_CACHE_ENTRIES = 200;
+
+/** The relay keeps the state of a swap at 1Click for this long, so that several pages of one swap spend one call. */
+export const ONECLICK_STATUS_CACHE_MS = 5_000;
+
+/** The relay keeps at most this many states of 1Click at once, and forgets them all when the list is full. */
+export const ONECLICK_STATUS_CACHE_ENTRIES = 500;
+
+/** The relay reads the token list of 1Click at most this often, for the check of /ready. */
+export const ONECLICK_TOKENS_CACHE_MS = 10 * 60_000;
+
+/**
+ * A swap at 1Click takes its deposit until this long after its quote, then refunds what came late. The deposit comes
+ * from the wallet of the user on Starknet, which takes a minute; the fixed rate of ChangeNOW waits about as long.
+ */
+export const ONECLICK_DEADLINE_MS = 20 * 60_000;
+
+/** How far the coin that arrives may fall below the quote of 1Click, in basis points: 1%. */
+export const ONECLICK_SLIPPAGE_BPS = 100;
+
+/** How long a quote of 1Click waits for its market makers, so that a better one can come in. */
+export const ONECLICK_QUOTE_WAIT_MS = 2_000;
+
+/** The name of Kranox at 1Click, in lowercase as its documentation asks, which tells 1Click where a swap came from. */
+export const ONECLICK_REFERRAL = "kranox";
+
+/**
+ * The least of each coin of origin that the relay sends through 1Click, which names no minimum of its own: CHECKED
+ * 13 Oct 2026, 1 STRK quoted 0.011 USDG after the withdraw fee of 0.075 USDG, and 20 STRK 1.655 USDG. The fee is the
+ * same for any amount, so the minimum keeps it below a twentieth of what arrives. ChangeNOW takes STRK from 18.88.
+ */
+export const ONECLICK_MIN_FROM: Readonly<Partial<Record<FromAsset, number>>> = { strk: 20 };
 
 /** A call to ChangeNOW that takes longer than this fails, so that the app does not wait without end. */
 export const UPSTREAM_TIMEOUT_MS = 20_000;
@@ -267,6 +327,13 @@ export function loadConfig(): RelayConfig {
   if (simpleswapApiKey !== null && simpleswapApiKey === changenowApiKey) {
     throw new Error("SIMPLESWAP_API_KEY_FILE and CHANGENOW_API_KEY_FILE hold the same key.");
   }
+  // The partner key of 1Click is optional too: without it, 1Click serves the relay at its public fee.
+  const oneclickApiKey = process.env.ONECLICK_API_KEY_FILE?.trim()
+    ? readKey("ONECLICK_API_KEY_FILE", "NEAR Intents")
+    : null;
+  if (oneclickApiKey !== null && (oneclickApiKey === changenowApiKey || oneclickApiKey === simpleswapApiKey)) {
+    throw new Error("ONECLICK_API_KEY_FILE holds the key of another exchanger.");
+  }
   // The scan of an address is optional: without the variable, its route answers that the relay cannot scan yet.
   const blockscoutApiKey = process.env.BLOCKSCOUT_API_KEY_FILE?.trim()
     ? readKey("BLOCKSCOUT_API_KEY_FILE", "Blockscout")
@@ -279,6 +346,7 @@ export function loadConfig(): RelayConfig {
     port,
     changenowApiKey,
     simpleswapApiKey,
+    oneclickApiKey,
     blockscoutApiKey,
     alchemyApiKey,
     swapTokenKey,

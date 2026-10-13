@@ -43,8 +43,8 @@ const refusal = (status: number, message: string): Response =>
 
 test("sends the key in a header only, follows no redirect, and reads the result of the envelope", async () => {
   const { fetchImpl, sent } = fakeFetch(() => result({ min: "0.0246892632", max: "1.495230709567" }));
-  const range = await new SimpleSwap(KEY, { fetchImpl }).payRange("usdg", "fixed");
-  assert.deepEqual(range, { minXmr: 0.0246892632, maxXmr: 1.495230709567 });
+  const range = await new SimpleSwap(KEY, { fetchImpl }).payRange("xmr", "usdg", "fixed");
+  assert.deepEqual(range, { minFrom: 0.0246892632, maxFrom: 1.495230709567 });
   assert.equal(sent.length, 1);
   const url = new URL(sent[0].url);
   assert.equal(url.pathname, "/v3/ranges");
@@ -64,13 +64,13 @@ test("takes a floating range without a top, and keeps a range for a while", asyn
   const time = clock();
   const { fetchImpl, sent } = fakeFetch(() => result({ min: "0.0143601108", max: null }));
   const simpleswap = new SimpleSwap(KEY, { fetchImpl, now: time.now });
-  assert.deepEqual(await simpleswap.payRange("eth", "floating"), { minXmr: 0.0143601108, maxXmr: null });
-  await simpleswap.payRange("eth", "floating");
+  assert.deepEqual(await simpleswap.payRange("xmr", "eth", "floating"), { minFrom: 0.0143601108, maxFrom: null });
+  await simpleswap.payRange("xmr", "eth", "floating");
   assert.equal(sent.length, 1, "the second range of the same pair comes from memory");
-  await simpleswap.payRange("usdg", "floating");
+  await simpleswap.payRange("xmr", "usdg", "floating");
   assert.equal(sent.length, 2, "each pair has its own range");
   time.advance(SIMPLESWAP_RANGE_CACHE_MS);
-  await simpleswap.payRange("eth", "floating");
+  await simpleswap.payRange("xmr", "eth", "floating");
   assert.equal(sent.length, 3, "an old range is asked for again");
 });
 
@@ -85,7 +85,7 @@ test("estimates at a fixed rate with its id and its time, and at a floating rate
       : result({ estimatedAmount: "48.159582", rateId: null, validUntil: null }),
   );
   const simpleswap = new SimpleSwap(KEY, { fetchImpl });
-  assert.deepEqual(await simpleswap.payEstimate("usdg", "fixed", "0.1"), {
+  assert.deepEqual(await simpleswap.payEstimate("xmr", "usdg", "fixed", "0.1"), {
     amount: 47.953709,
     rateId: "xmp4w9f3x2cy0tug8ju_rs97tvfcp15d",
     validUntil: "2026-10-12T11:51:43.473Z",
@@ -94,7 +94,7 @@ test("estimates at a fixed rate with its id and its time, and at a floating rate
     withdrawalFee: null,
     speedMinutes: null,
   });
-  const floating = await simpleswap.payEstimate("usdg", "floating", "0.1");
+  const floating = await simpleswap.payEstimate("xmr", "usdg", "floating", "0.1");
   assert.ok(!("limit" in floating));
   assert.equal(floating.amount, 48.159582);
   assert.equal(floating.rateId, null);
@@ -108,25 +108,25 @@ test("turns a refusal of an amount into the range of the rate, on the side the a
     refusal(422, "Amount does not fall within the range. Min: 0.0246948222, max: 1.495551411224"),
   );
   const simpleswap = new SimpleSwap(KEY, { fetchImpl });
-  assert.deepEqual(await simpleswap.payEstimate("usdg", "fixed", "0.001"), {
+  assert.deepEqual(await simpleswap.payEstimate("xmr", "usdg", "fixed", "0.001"), {
     limit: "below",
-    minXmr: 0.0246948222,
-    maxXmr: 1.495551411224,
+    minFrom: 0.0246948222,
+    maxFrom: 1.495551411224,
   });
-  assert.deepEqual(await simpleswap.payEstimate("usdg", "fixed", "50"), {
+  assert.deepEqual(await simpleswap.payEstimate("xmr", "usdg", "fixed", "50"), {
     limit: "above",
-    minXmr: 0.0246948222,
-    maxXmr: 1.495551411224,
+    minFrom: 0.0246948222,
+    maxFrom: 1.495551411224,
   });
   const floating = fakeFetch(() => refusal(422, "Amount does not fall within the range. Min: 0.0143601108, max: null"));
-  assert.deepEqual(await new SimpleSwap(KEY, floating).payEstimate("usdg", "floating", "0.001"), {
+  assert.deepEqual(await new SimpleSwap(KEY, floating).payEstimate("xmr", "usdg", "floating", "0.001"), {
     limit: "below",
-    minXmr: 0.0143601108,
-    maxXmr: null,
+    minFrom: 0.0143601108,
+    maxFrom: null,
   });
   // A refusal without a range stays a refusal, with its text.
   const other = fakeFetch(() => refusal(422, "Pair is not available"));
-  await assert.rejects(new SimpleSwap(KEY, other).payEstimate("usdg", "fixed", "0.1"), (error: unknown) => {
+  await assert.rejects(new SimpleSwap(KEY, other).payEstimate("xmr", "usdg", "fixed", "0.1"), (error: unknown) => {
     assert.ok(error instanceof UpstreamError);
     assert.equal(error.status, 422);
     assert.equal(error.service, "SimpleSwap");
@@ -154,7 +154,7 @@ test("creates an exchange with the names of v3 and reads back what the relay che
     }),
   );
   const simpleswap = new SimpleSwap(KEY, { fetchImpl });
-  const created = await simpleswap.createPay("usdg", "fixed", "0.1", RECIPIENT, REFUND, "rate-id-1");
+  const created = await simpleswap.createPay("xmr", "usdg", "fixed", "0.1", RECIPIENT, REFUND, "rate-id-1");
   assert.deepEqual(created, {
     id: "pch7l7kd1v2mzh1",
     fromAmount: 0.1,
@@ -167,6 +167,7 @@ test("creates an exchange with the names of v3 and reads back what the relay che
     toCurrency: "usdg",
     toNetwork: "robinhood",
     flow: "fixed",
+    validUntil: null,
   });
   assert.equal(sent[0].init.method, "POST");
   assert.equal(new URL(sent[0].url).pathname, "/v3/exchanges");
@@ -181,7 +182,7 @@ test("creates an exchange with the names of v3 and reads back what the relay che
     userRefundAddress: REFUND,
     rateId: "rate-id-1",
   });
-  assert.deepEqual(simpleswap.payNames("usdg", "fixed"), {
+  assert.deepEqual(simpleswap.payNames("xmr", "usdg", "fixed"), {
     from: { currency: "xmr", network: "xmr" },
     to: { currency: "usdg", network: "robinhood" },
     flow: "fixed",
@@ -200,7 +201,7 @@ test("creates an exchange with the names of v3 and reads back what the relay che
       type: "floating",
     }),
   );
-  const made = await new SimpleSwap(KEY, floating).createPay("eth", "floating", "1", RECIPIENT, REFUND, null);
+  const made = await new SimpleSwap(KEY, floating).createPay("xmr", "eth", "floating", "1", RECIPIENT, REFUND, null);
   assert.equal(made.toAmount, 2, "amountTo serves when expectedAmount is missing");
   assert.equal("rateId" in JSON.parse(String(floating.sent[0].init.body)), false, "a floating rate sends no rate id");
 });
@@ -249,16 +250,16 @@ test("stops calling SimpleSwap above the budget of its key in a minute, and call
   const simpleswap = new SimpleSwap(KEY, { fetchImpl, now: time.now });
   // Each call asks another amount, so that none comes from the cache of quotes.
   for (let call = 0; call < SIMPLESWAP_CALLS_PER_MINUTE; call++) {
-    await simpleswap.payEstimate("eth", "floating", String(call + 1));
+    await simpleswap.payEstimate("xmr", "eth", "floating", String(call + 1));
   }
-  await assert.rejects(simpleswap.payEstimate("eth", "floating", "0.5"), (error: unknown) => {
+  await assert.rejects(simpleswap.payEstimate("xmr", "eth", "floating", "0.5"), (error: unknown) => {
     assert.ok(error instanceof GatewayError);
     assert.equal(error.status, 503);
     return true;
   });
   assert.equal(sent.length, SIMPLESWAP_CALLS_PER_MINUTE, "the call over the budget never reaches SimpleSwap");
   time.advance(60_000 / SIMPLESWAP_CALLS_PER_MINUTE);
-  await simpleswap.payEstimate("eth", "floating", "0.5");
+  await simpleswap.payEstimate("xmr", "eth", "floating", "0.5");
   assert.equal(sent.length, SIMPLESWAP_CALLS_PER_MINUTE + 1);
 });
 
@@ -266,7 +267,7 @@ test("answers a refused key and a failure of SimpleSwap with the status of the a
   const { fetchImpl } = fakeFetch(() =>
     Response.json({ code: 401, error: "Unauthorized", message: "Wrong api key" }, { status: 401 }),
   );
-  await assert.rejects(new SimpleSwap(KEY, { fetchImpl }).payRange("eth", "fixed"), (error: unknown) => {
+  await assert.rejects(new SimpleSwap(KEY, { fetchImpl }).payRange("xmr", "eth", "fixed"), (error: unknown) => {
     assert.ok(error instanceof UpstreamError);
     assert.equal(error.status, 401);
     assert.equal(error.service, "SimpleSwap");
@@ -275,13 +276,13 @@ test("answers a refused key and a failure of SimpleSwap with the status of the a
   const down = fakeFetch(() => {
     throw new Error("connection refused");
   });
-  await assert.rejects(new SimpleSwap(KEY, down).payRange("eth", "fixed"), (error: unknown) => {
+  await assert.rejects(new SimpleSwap(KEY, down).payRange("xmr", "eth", "fixed"), (error: unknown) => {
     assert.ok(error instanceof GatewayError);
     assert.equal(error.status, 504);
     return true;
   });
   const odd = fakeFetch(() => Response.json({ traceId: "trace" }));
-  await assert.rejects(new SimpleSwap(KEY, odd).payRange("eth", "fixed"), (error: unknown) => {
+  await assert.rejects(new SimpleSwap(KEY, odd).payRange("xmr", "eth", "fixed"), (error: unknown) => {
     assert.ok(error instanceof GatewayError);
     assert.equal(error.status, 502);
     return true;
@@ -300,7 +301,7 @@ test("refuses a created exchange without the names of its pair, so that the chec
     }),
   );
   await assert.rejects(
-    new SimpleSwap(KEY, { fetchImpl }).createPay("eth", "fixed", "1", RECIPIENT, REFUND, "r"),
+    new SimpleSwap(KEY, { fetchImpl }).createPay("xmr", "eth", "fixed", "1", RECIPIENT, REFUND, "r"),
     (error: unknown) => {
       assert.ok(error instanceof GatewayError);
       assert.equal(error.status, 502);
@@ -314,13 +315,16 @@ test("keeps a refusal whose range holds the amount as a refusal, with its text (
   const { fetchImpl } = fakeFetch(() =>
     refusal(422, "Amount does not fall within the range. Min: 0.0246948222, max: 1.495551411224"),
   );
-  await assert.rejects(new SimpleSwap(KEY, { fetchImpl }).payEstimate("usdg", "fixed", "0.5"), (error: unknown) => {
-    assert.ok(error instanceof UpstreamError);
-    assert.equal(error.status, 422);
-    return true;
-  });
+  await assert.rejects(
+    new SimpleSwap(KEY, { fetchImpl }).payEstimate("xmr", "usdg", "fixed", "0.5"),
+    (error: unknown) => {
+      assert.ok(error instanceof UpstreamError);
+      assert.equal(error.status, 422);
+      return true;
+    },
+  );
   const noTop = fakeFetch(() => refusal(422, "Amount does not fall within the range. Min: 0.0143601108, max: null"));
-  await assert.rejects(new SimpleSwap(KEY, noTop).payEstimate("usdg", "floating", "5"), (error: unknown) => {
+  await assert.rejects(new SimpleSwap(KEY, noTop).payEstimate("xmr", "usdg", "floating", "5"), (error: unknown) => {
     assert.ok(error instanceof UpstreamError);
     return true;
   });
@@ -330,12 +334,24 @@ test("keeps a quote for a few seconds, so that the pages of the app spend one ca
   const time = clock();
   const { fetchImpl, sent } = fakeFetch(() => result({ estimatedAmount: "48.1", rateId: null, validUntil: null }));
   const simpleswap = new SimpleSwap(KEY, { fetchImpl, now: time.now });
-  await simpleswap.payEstimate("usdg", "floating", "0.1");
-  await simpleswap.payEstimate("usdg", "floating", "0.1");
+  await simpleswap.payEstimate("xmr", "usdg", "floating", "0.1");
+  await simpleswap.payEstimate("xmr", "usdg", "floating", "0.1");
   assert.equal(sent.length, 1, "the same quote again comes from memory");
-  await simpleswap.payEstimate("usdg", "floating", "0.2");
+  await simpleswap.payEstimate("xmr", "usdg", "floating", "0.2");
   assert.equal(sent.length, 2, "another amount is its own quote");
   time.advance(SIMPLESWAP_ESTIMATE_CACHE_MS);
-  await simpleswap.payEstimate("usdg", "floating", "0.1");
+  await simpleswap.payEstimate("xmr", "usdg", "floating", "0.1");
   assert.equal(sent.length, 3, "an old quote is asked for again");
+});
+
+test("takes XMR alone, and says so for another coin before any call", async () => {
+  const { fetchImpl, sent } = fakeFetch(() => result({ min: "1", max: null }));
+  const simpleswap = new SimpleSwap(KEY, { fetchImpl });
+  assert.deepEqual(simpleswap.origins, ["xmr"]);
+  await assert.rejects(simpleswap.payRange("strk", "usdg", "floating"), (error: unknown) => {
+    assert.ok(error instanceof GatewayError);
+    assert.match(error.message, /does not take STRK/);
+    return true;
+  });
+  assert.equal(sent.length, 0);
 });

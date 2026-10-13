@@ -17,10 +17,12 @@ import {
 } from "./config.mts";
 import {
   GatewayError,
+  PAY_RATE_NAMES,
   UpstreamError,
   type ChainAsset,
   type CreatedExchange,
   type ExchangeStatus,
+  type FromAsset,
   type PairNames,
   type PayEstimate,
   type PayExchanger,
@@ -41,6 +43,16 @@ const CHAIN_SIDES: Record<ChainAsset, Side> = {
 };
 
 const XMR: Side = { currency: "xmr", network: "xmr" };
+
+/** The coins of origin that the relay sends through SimpleSwap: XMR alone (NOT CHECKED: whether v3 lists STRK). */
+const FROM_SIDES: Partial<Record<FromAsset, Side>> = { xmr: XMR };
+
+/** The side of origin of [from], or a refusal for a coin the relay does not send through SimpleSwap. */
+function fromSide(from: FromAsset): Side {
+  const side = FROM_SIDES[from];
+  if (side === undefined) throw new GatewayError(502, `${SIMPLESWAP_NAME} does not take ${from.toUpperCase()}.`);
+  return side;
+}
 
 /** The type of an exchange as v3 names it, which is the rate of pay. */
 const RATE_TYPES: Record<PayRate, string> = { fixed: "fixed", floating: "floating" };
@@ -69,11 +81,12 @@ export interface SimpleSwapOptions {
   now?: () => number;
 }
 
-function pairQuery(asset: ChainAsset, rate: PayRate): Record<string, string> {
+function pairQuery(from: FromAsset, asset: ChainAsset, rate: PayRate): Record<string, string> {
+  const origin = fromSide(from);
   const to = CHAIN_SIDES[asset];
   return {
-    tickerFrom: XMR.currency,
-    networkFrom: XMR.network,
+    tickerFrom: origin.currency,
+    networkFrom: origin.network,
     tickerTo: to.currency,
     networkTo: to.network,
     fixed: String(rate === "fixed"),
@@ -101,23 +114,25 @@ function requireString(data: Json, field: string): string {
 }
 
 /** The range of an amount that SimpleSwap refused, from the text of its refusal, with the side the amount fell on. */
-function outOfRange(error: UpstreamError, xmrAmount: string): PayOutOfRange | null {
+function outOfRange(error: UpstreamError, fromAmount: string): PayOutOfRange | null {
   if (error.status !== 422) return null;
   const match = RANGE_TEXT.exec(error.message);
   if (match === null) return null;
-  const minXmr = amountOrNull(match[1]);
-  const maxXmr = match[2] === "null" ? null : amountOrNull(match[2]);
-  if (minXmr === null) return null;
+  const minFrom = amountOrNull(match[1]);
+  const maxFrom = match[2] === "null" ? null : amountOrNull(match[2]);
+  if (minFrom === null) return null;
   // The side comes from the facts of the range alone; a refusal whose range holds the amount stays a refusal, with
   // its text (R-07 of the scan of 12 Oct 2026).
-  const amount = Number(xmrAmount);
-  if (amount < minXmr) return { limit: "below", minXmr, maxXmr };
-  if (maxXmr !== null && amount > maxXmr) return { limit: "above", minXmr, maxXmr };
+  const amount = Number(fromAmount);
+  if (amount < minFrom) return { limit: "below", minFrom, maxFrom };
+  if (maxFrom !== null && amount > maxFrom) return { limit: "above", minFrom, maxFrom };
   return null;
 }
 
 export class SimpleSwap implements PayExchanger {
   readonly name = SIMPLESWAP_NAME;
+  readonly origins: readonly FromAsset[] = ["xmr"];
+  readonly rates: readonly PayRate[] = PAY_RATE_NAMES;
   readonly #apiKey: string;
   readonly #fetch: typeof fetch;
   readonly #now: () => number;
@@ -132,35 +147,50 @@ export class SimpleSwap implements PayExchanger {
     this.#limiter = new CallLimiter(SIMPLESWAP_CALLS_PER_MINUTE, now, MS_PER_MINUTE);
   }
 
-  async payRange(asset: ChainAsset, rate: PayRate): Promise<PayRange> {
-    const key = `${asset}:${rate}`;
+  /** One range, which the cache keeps rare, shows that SimpleSwap takes the key of the relay (R-11 of the scan of 12 Oct 2026). */
+  async ready(): Promise<void> {
+    await this.payRange("xmr", "eth", "fixed");
+  }
+
+  async payRange(from: FromAsset, asset: ChainAsset, rate: PayRate): Promise<PayRange> {
+    const key = `${from}:${asset}:${rate}`;
     const kept = this.#ranges.get(key);
     if (kept !== undefined && this.#now() - kept.at < SIMPLESWAP_RANGE_CACHE_MS) return kept.value;
-    const data = await this.#call(`/v3/ranges?${new URLSearchParams(pairQuery(asset, rate))}`);
-    const value = { minXmr: requireAmount(data, "min"), maxXmr: amountOrNull(data.max) };
+    const data = await this.#call(`/v3/ranges?${new URLSearchParams(pairQuery(from, asset, rate))}`);
+    const value = { minFrom: requireAmount(data, "min"), maxFrom: amountOrNull(data.max) };
     this.#ranges.set(key, { value, at: this.#now() });
     return value;
   }
 
-  async payEstimate(asset: ChainAsset, rate: PayRate, xmrAmount: string): Promise<PayEstimate | PayOutOfRange> {
+  async payEstimate(
+    from: FromAsset,
+    asset: ChainAsset,
+    rate: PayRate,
+    fromAmount: string,
+  ): Promise<PayEstimate | PayOutOfRange> {
     // The same quote asked again within a few seconds, as the pages of the app do, costs one call of the budget
     // (R-01 of the scan of 12 Oct 2026). A fixed rate holds for about two minutes, so a quote this young is still good.
-    const key = `${asset}:${rate}:${xmrAmount}`;
+    const key = `${from}:${asset}:${rate}:${fromAmount}`;
     const kept = this.#estimates.get(key);
     if (kept !== undefined && this.#now() - kept.at < SIMPLESWAP_ESTIMATE_CACHE_MS) return kept.value;
-    const value = await this.#askEstimate(asset, rate, xmrAmount);
+    const value = await this.#askEstimate(from, asset, rate, fromAmount);
     if (this.#estimates.size >= SIMPLESWAP_ESTIMATE_CACHE_ENTRIES) this.#estimates.clear();
     this.#estimates.set(key, { value, at: this.#now() });
     return value;
   }
 
-  async #askEstimate(asset: ChainAsset, rate: PayRate, xmrAmount: string): Promise<PayEstimate | PayOutOfRange> {
-    const query = new URLSearchParams({ ...pairQuery(asset, rate), amount: xmrAmount });
+  async #askEstimate(
+    from: FromAsset,
+    asset: ChainAsset,
+    rate: PayRate,
+    fromAmount: string,
+  ): Promise<PayEstimate | PayOutOfRange> {
+    const query = new URLSearchParams({ ...pairQuery(from, asset, rate), amount: fromAmount });
     let data: Json;
     try {
       data = await this.#call(`/v3/estimates?${query}`);
     } catch (error) {
-      const range = error instanceof UpstreamError ? outOfRange(error, xmrAmount) : null;
+      const range = error instanceof UpstreamError ? outOfRange(error, fromAmount) : null;
       if (range !== null) return range;
       throw error;
     }
@@ -177,20 +207,22 @@ export class SimpleSwap implements PayExchanger {
   }
 
   async createPay(
+    from: FromAsset,
     asset: ChainAsset,
     rate: PayRate,
-    xmrAmount: string,
+    fromAmount: string,
     address: string,
     refundAddress: string,
     rateId: string | null,
   ): Promise<CreatedExchange> {
+    const origin = fromSide(from);
     const to = CHAIN_SIDES[asset];
     const body: Json = {
-      tickerFrom: XMR.currency,
-      networkFrom: XMR.network,
+      tickerFrom: origin.currency,
+      networkFrom: origin.network,
       tickerTo: to.currency,
       networkTo: to.network,
-      amount: xmrAmount,
+      amount: fromAmount,
       addressTo: address,
       fixed: rate === "fixed",
       userRefundAddress: refundAddress,
@@ -214,11 +246,12 @@ export class SimpleSwap implements PayExchanger {
       toCurrency: requireString(data, "tickerTo"),
       toNetwork: requireString(data, "networkTo"),
       flow: requireString(data, "type"),
+      validUntil: stringOrNull(data.validUntil),
     };
   }
 
-  payNames(asset: ChainAsset, rate: PayRate): PairNames {
-    return { from: XMR, to: CHAIN_SIDES[asset], flow: RATE_TYPES[rate] };
+  payNames(from: FromAsset, asset: ChainAsset, rate: PayRate): PairNames {
+    return { from: fromSide(from), to: CHAIN_SIDES[asset], flow: RATE_TYPES[rate] };
   }
 
   async status(id: string): Promise<ExchangeStatus> {

@@ -158,6 +158,7 @@ test("reads the coins, the networks, and the flow of a created exchange when Cha
     KEY,
     fakeFetch(() => Response.json(answer)),
   ).createPay(
+    "xmr",
     "usdg",
     "fixed",
     "0.1",
@@ -195,4 +196,43 @@ test("the limiter refills at its rate and never holds more than one second of ca
   assert.equal(limiter.take(), true);
   assert.equal(limiter.take(), false, "a long quiet time gives at most the calls of one second");
   assert.throws(() => new CallLimiter(0));
+});
+
+test("asks v2 for STRK on the network strk, and gives a range in the coin of origin", async () => {
+  const { fetchImpl, sent } = fakeFetch(() => Response.json({ minAmount: 18.8802983, maxAmount: null }));
+  const changenow = new ChangeNow(KEY, { fetchImpl });
+  assert.deepEqual(changenow.origins, ["xmr", "strk"]);
+  assert.deepEqual(await changenow.payRange("strk", "usdg", "floating"), { minFrom: 18.8802983, maxFrom: null });
+  const url = new URL(sent[0].url);
+  assert.equal(url.pathname, "/v2/exchange/range");
+  assert.deepEqual(Object.fromEntries(url.searchParams), {
+    fromCurrency: "strk",
+    fromNetwork: "strk",
+    toCurrency: "usdg",
+    toNetwork: "hood",
+    flow: "standard",
+  });
+  assert.deepEqual(changenow.payNames("strk", "eth", "fixed"), {
+    from: { currency: "strk", network: "strk" },
+    to: { currency: "eth", network: "hood" },
+    flow: "fixed-rate",
+  });
+  const refusing = new ChangeNow(
+    KEY,
+    fakeFetch(() =>
+      Response.json(
+        {
+          error: "out_of_range",
+          message: "Out of min amount",
+          payload: { range: { minAmount: 18.88, maxAmount: null } },
+        },
+        { status: 400 },
+      ),
+    ),
+  );
+  assert.deepEqual(await refusing.payEstimate("strk", "usdg", "floating", "1"), {
+    limit: "below",
+    minFrom: 18.88,
+    maxFrom: null,
+  });
 });

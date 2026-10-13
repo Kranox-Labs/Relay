@@ -9,16 +9,21 @@
 // the input of pay; the first take of 5 Oct 2026 asked for the amount that the recipient gets ("reverse"). The same
 // day the owner asked to let the user choose the floating rate as well (flow "standard"): CHECKED 6 Oct 2026, its
 // minimum is about half of the fixed one, it has no top, it gives no rate id, and below its minimum it answers 400
-// "Out of min amount" with the range.
+// "Out of min amount" with the range. From 13 Oct 2026 pay also takes STRK: CHECKED 13 Oct 2026 with the key of
+// Kranox, Starknet is the network "strk" (the network "starknet" answers "Currency strk is not supported"), and STRK
+// into USDG on Robinhood Chain ranges from 18.88 STRK at the floating rate and from 110.06 to 9142.31 at the fixed one.
 import { CHANGENOW_BASE_URL, MIN_AMOUNT_CACHE_MS, UPSTREAM_CALLS_PER_SECOND, UPSTREAM_TIMEOUT_MS } from "./config.mts";
 import {
+  FROM_ASSET_NAMES,
   GatewayError,
+  PAY_RATE_NAMES,
   UpstreamError,
   type ChainAsset,
   type CreatedExchange,
   type Estimate,
   type ExchangeStatus,
   type Exchanger,
+  type FromAsset,
   type PairNames,
   type PayEstimate,
   type PayOutOfRange,
@@ -37,7 +42,13 @@ export const CHAIN_ASSETS: Record<ChainAsset, Side> = {
   usdg: { currency: "usdg", network: "hood" },
 };
 
-const XMR: Side = { currency: "xmr", network: "xmr" };
+/** The coins of origin of pay, with their names in v2 of the API: XMR on Monero, and STRK on Starknet. */
+export const FROM_SIDES: Record<FromAsset, Side> = {
+  xmr: { currency: "xmr", network: "xmr" },
+  strk: { currency: "strk", network: "strk" },
+};
+
+const XMR: Side = FROM_SIDES.xmr;
 
 /** The flow with a floating rate: the amount of XMR follows the market until the deposit arrives. */
 const STANDARD_FLOW = "standard";
@@ -70,8 +81,8 @@ function outOfRange(error: UpstreamError): PayOutOfRange | null {
   if (range === null) return null;
   return {
     limit: /max/i.test(error.message) ? "above" : "below",
-    minXmr: numberOrNull(range.minAmount),
-    maxXmr: numberOrNull(range.maxAmount),
+    minFrom: numberOrNull(range.minAmount),
+    maxFrom: numberOrNull(range.maxAmount),
   };
 }
 
@@ -95,6 +106,8 @@ export interface ChangeNowOptions {
 
 export class ChangeNow implements Exchanger {
   readonly name = CHANGENOW_NAME;
+  readonly origins: readonly FromAsset[] = FROM_ASSET_NAMES;
+  readonly rates: readonly PayRate[] = PAY_RATE_NAMES;
   readonly #apiKey: string;
   readonly #fetch: typeof fetch;
   readonly #now: () => number;
@@ -147,27 +160,34 @@ export class ChangeNow implements Exchanger {
     return this.#created(await this.#call("/v2/exchange", { method: "POST", body: JSON.stringify(body) }));
   }
 
-  async payRange(asset: ChainAsset, rate: PayRate): Promise<PayRange> {
+  async payRange(from: FromAsset, asset: ChainAsset, rate: PayRate): Promise<PayRange> {
+    const origin = FROM_SIDES[from];
     const to = CHAIN_ASSETS[asset];
     const query = new URLSearchParams({
-      fromCurrency: XMR.currency,
-      fromNetwork: XMR.network,
+      fromCurrency: origin.currency,
+      fromNetwork: origin.network,
       toCurrency: to.currency,
       toNetwork: to.network,
       flow: PAY_RATES[rate],
     });
     const data = await this.#call(`/v2/exchange/range?${query}`);
-    return { minXmr: requireNumber(data, "minAmount"), maxXmr: numberOrNull(data.maxAmount) };
+    return { minFrom: requireNumber(data, "minAmount"), maxFrom: numberOrNull(data.maxAmount) };
   }
 
-  async payEstimate(asset: ChainAsset, rate: PayRate, xmrAmount: string): Promise<PayEstimate | PayOutOfRange> {
+  async payEstimate(
+    from: FromAsset,
+    asset: ChainAsset,
+    rate: PayRate,
+    fromAmount: string,
+  ): Promise<PayEstimate | PayOutOfRange> {
+    const origin = FROM_SIDES[from];
     const to = CHAIN_ASSETS[asset];
     const query = new URLSearchParams({
-      fromCurrency: XMR.currency,
-      fromNetwork: XMR.network,
+      fromCurrency: origin.currency,
+      fromNetwork: origin.network,
       toCurrency: to.currency,
       toNetwork: to.network,
-      fromAmount: xmrAmount,
+      fromAmount,
       type: DIRECT_TYPE,
       flow: PAY_RATES[rate],
     });
@@ -191,20 +211,22 @@ export class ChangeNow implements Exchanger {
   }
 
   async createPay(
+    from: FromAsset,
     asset: ChainAsset,
     rate: PayRate,
-    xmrAmount: string,
+    fromAmount: string,
     address: string,
     refundAddress: string,
     rateId: string | null,
   ): Promise<CreatedExchange> {
+    const origin = FROM_SIDES[from];
     const to = CHAIN_ASSETS[asset];
     const body: Json = {
-      fromCurrency: XMR.currency,
-      fromNetwork: XMR.network,
+      fromCurrency: origin.currency,
+      fromNetwork: origin.network,
       toCurrency: to.currency,
       toNetwork: to.network,
-      fromAmount: xmrAmount,
+      fromAmount,
       address,
       refundAddress,
       flow: PAY_RATES[rate],
@@ -214,8 +236,8 @@ export class ChangeNow implements Exchanger {
     return this.#created(await this.#call("/v2/exchange", { method: "POST", body: JSON.stringify(body) }));
   }
 
-  payNames(asset: ChainAsset, rate: PayRate): PairNames {
-    return { from: XMR, to: CHAIN_ASSETS[asset], flow: PAY_RATES[rate] };
+  payNames(from: FromAsset, asset: ChainAsset, rate: PayRate): PairNames {
+    return { from: FROM_SIDES[from], to: CHAIN_ASSETS[asset], flow: PAY_RATES[rate] };
   }
 
   receiveNames(asset: ChainAsset): PairNames {
@@ -251,6 +273,7 @@ export class ChangeNow implements Exchanger {
       toCurrency: stringOrNull(data.toCurrency),
       toNetwork: stringOrNull(data.toNetwork),
       flow: stringOrNull(data.flow),
+      validUntil: stringOrNull(data.validUntil),
     };
   }
 

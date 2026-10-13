@@ -478,6 +478,7 @@ async function relayWith(scanner: ChainScanner | null): Promise<{ base: string; 
   const relay = createRelay({
     exchanger: {} as Exchanger,
     simpleswap: null,
+    oneclick: null,
     scanner,
     tokens: new SwapTokens("a secret of the test"),
     creations: new CreationKeys(60_000, 10),
